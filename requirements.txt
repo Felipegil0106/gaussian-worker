@@ -1,0 +1,16 @@
+runpod==1.7.0
+numpy==1.26.4
+pillow==10.2.0
+requests==2.31.0
+plyfile==1.0.3
+tqdm==4.66.1
+opencv-python-headless==4.9.0.80
+scipy==1.11.4
+transformers==4.40.0
+accelerate==0.30.0
+safetensors==0.4.3
+huggingface_hub==0.22.2
+tyro==0.7.0
+viser==0.1.27
+tensorboard==2.15.1
+imageio==2.34.0
