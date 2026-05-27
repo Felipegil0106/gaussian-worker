@@ -2,9 +2,14 @@
 Worker GPU para Gaussian Splatting — Pipeline de 8 etapas
 Recibe ZIP de fotos, devuelve .ply + .glb (collision mesh)
 
+FIX v2 (2026-05-27): Filtro de blur ADAPTATIVO.
+  - El umbral fijo de 100 era inadecuado para fotos de móviles modernos.
+  - Ahora analizamos el set de fotos y usamos un umbral relativo al conjunto.
+  - Si TODAS las fotos serían rechazadas, mantenemos las mejores.
+
 Etapas:
   1. Extracción inteligente de frames (FFmpeg mpdecimate)
-  2. Filtro de blur (Laplacian variance)
+  2. Filtro de blur ADAPTATIVO (Laplacian variance + percentiles)
   3. Depth Anything V2 (depth priors para paredes blancas)
   4. Mask2Former (máscaras vidrios/espejos)
   5. COLMAP (poses de cámara)
@@ -29,7 +34,12 @@ TIMEOUTS = {
 }
 
 ITERS = {"fast":7000, "balanced":30000, "quality":50000}
-BLUR_THRESHOLD = 100.0
+
+# FIX v2: Umbrales de blur ajustados para móviles modernos
+BLUR_THRESHOLD_ABSOLUTE = 30.0   # Bajado de 100 a 30 (móviles)
+BLUR_PERCENTILE_FALLBACK = 25    # Si todo se rechaza, eliminar solo el percentil 25 más bajo
+MIN_VALID_RATIO = 0.5            # Si quedaríamos con < 50% de fotos, usar modo permisivo
+
 MIN_IMGS, MAX_IMGS = 20, 1000
 
 # ── Logging ────────────────────────────────────────────────────
@@ -89,7 +99,6 @@ def download(url, dest, timeout=600):
     dl = 0
     with open(dest,"wb") as f:
         for chunk in r.iter_content(1024*1024):
-            if time.time() > time.time() + timeout: raise Timeout("Download timeout")
             f.write(chunk); dl += len(chunk)
     log(f"Descargado: {dl//(1024*1024)} MB")
 
@@ -126,22 +135,89 @@ def extract_frames(raw_dir, frames_dir):
     log(f"Frames: {count}")
     return count
 
-# ── Etapa 2: Filtro blur ──────────────────────────────────────
+# ── Etapa 2: Filtro blur ADAPTATIVO ───────────────────────────
 
 def filter_blur(frames_dir):
-    log("━━━ ETAPA 2: Filtro de blur ━━━")
+    """
+    FIX v2: Filtro adaptativo.
+    1. Calcula varianza Laplaciana de TODAS las fotos
+    2. Si TODAS están sobre el umbral absoluto → solo elimina las muy malas
+    3. Si MUCHAS están bajo el umbral → usa percentiles (quita el 25% peor)
+    4. Garantiza que NO se eliminan todas las fotos
+    """
+    log("━━━ ETAPA 2: Filtro de blur ADAPTATIVO ━━━")
     import cv2
+
     frames = sorted([f for f in os.listdir(frames_dir) if f.endswith(".jpg")])
-    removed = 0
+    if not frames:
+        return 0
+
+    # PASO 1: Calcular varianza de cada foto
+    variances = []
     for f in frames:
         p = os.path.join(frames_dir, f)
         img = cv2.imread(p, cv2.IMREAD_GRAYSCALE)
-        if img is None: continue
+        if img is None:
+            variances.append((f, 0.0))
+            continue
         var = cv2.Laplacian(img, cv2.CV_64F).var()
-        if var < BLUR_THRESHOLD:
-            os.remove(p); removed += 1
-    kept = len(frames) - removed
-    log(f"Nítidas: {kept}, Borrosas eliminadas: {removed}")
+        variances.append((f, var))
+
+    if not variances:
+        return 0
+
+    # Estadísticas para diagnóstico
+    vars_only = [v for _, v in variances]
+    var_min = min(vars_only)
+    var_max = max(vars_only)
+    var_mean = sum(vars_only) / len(vars_only)
+    var_median = sorted(vars_only)[len(vars_only) // 2]
+    log(f"Varianzas: min={var_min:.1f}, max={var_max:.1f}, "
+        f"media={var_mean:.1f}, mediana={var_median:.1f}")
+
+    # PASO 2: Decidir estrategia
+    # Cuántas pasarían el umbral absoluto
+    above_absolute = sum(1 for _, v in variances if v >= BLUR_THRESHOLD_ABSOLUTE)
+    ratio = above_absolute / len(variances)
+
+    log(f"Sobre umbral absoluto ({BLUR_THRESHOLD_ABSOLUTE}): "
+        f"{above_absolute}/{len(variances)} ({ratio*100:.0f}%)")
+
+    if ratio >= MIN_VALID_RATIO:
+        # Modo normal: usar umbral absoluto
+        log(f"Modo: NORMAL (umbral absoluto = {BLUR_THRESHOLD_ABSOLUTE})")
+        to_remove = [f for f, v in variances if v < BLUR_THRESHOLD_ABSOLUTE]
+    else:
+        # Modo permisivo: usar percentil
+        # Calcular umbral del percentil 25 (eliminar solo el 25% más borroso)
+        sorted_vars = sorted(vars_only)
+        percentile_idx = max(1, len(sorted_vars) * BLUR_PERCENTILE_FALLBACK // 100)
+        adaptive_threshold = sorted_vars[percentile_idx]
+        log(f"Modo: PERMISIVO (umbral adaptativo = {adaptive_threshold:.1f}, "
+            f"percentil {BLUR_PERCENTILE_FALLBACK})")
+        to_remove = [f for f, v in variances if v < adaptive_threshold]
+
+    # PASO 3: Verificar que NO eliminamos todas
+    if len(to_remove) >= len(frames):
+        log("WARN: Habríamos eliminado todas las fotos. Conservando todas.", "WARN")
+        to_remove = []
+
+    # PASO 4: Si quedaríamos con menos de MIN_IMGS, conservar las mejores
+    remaining_after_remove = len(frames) - len(to_remove)
+    if remaining_after_remove < MIN_IMGS:
+        log(f"WARN: Solo quedarían {remaining_after_remove} fotos. "
+            f"Conservando las {MIN_IMGS} mejores.", "WARN")
+        # Ordenar por varianza descendente y mantener las mejores MIN_IMGS
+        sorted_by_var = sorted(variances, key=lambda x: x[1], reverse=True)
+        keep = set(f for f, _ in sorted_by_var[:MIN_IMGS])
+        to_remove = [f for f in frames if f not in keep]
+
+    # PASO 5: Eliminar
+    for f in to_remove:
+        os.remove(os.path.join(frames_dir, f))
+
+    kept = len(frames) - len(to_remove)
+    log(f"Nítidas: {kept}, Borrosas eliminadas: {len(to_remove)}")
     return kept
 
 # ── Etapa 3: Depth Anything V2 ────────────────────────────────
@@ -235,7 +311,6 @@ def run_colmap(images_dir, output_dir):
 def run_gsplat(data_dir, result_dir, iters):
     log(f"━━━ ETAPA 6: gsplat ({iters} iter) ━━━")
 
-    # Buscar el trainer en varias ubicaciones posibles
     trainer_paths = [
         "/opt/gsplat-repo/examples/simple_trainer.py",
         "/workspace/gsplat-repo/examples/simple_trainer.py",
@@ -251,7 +326,6 @@ def run_gsplat(data_dir, result_dir, iters):
              "https://github.com/nerfstudio-project/gsplat.git",
              "/workspace/gsplat-repo"], 300, "git_clone")
         trainer = "/workspace/gsplat-repo/examples/simple_trainer.py"
-        # Instalar deps del trainer
         reqs = "/workspace/gsplat-repo/examples/requirements.txt"
         if os.path.exists(reqs):
             run(["pip","install","-r",reqs], 300, "trainer_deps")
@@ -267,13 +341,10 @@ def run_gsplat(data_dir, result_dir, iters):
 
     log("gsplat OK")
 
-# ── Etapa 7: Cleanup (análisis de outliers) ───────────────────
+# ── Etapa 7: Cleanup ──────────────────────────────────────────
 
 def cleanup_ply(ply_path):
     log("━━━ ETAPA 7: Cleanup ━━━")
-    # Nota: gsplat PLY tiene atributos especiales que open3d no entiende.
-    # Por seguridad, solo analizamos y reportamos sin modificar el archivo.
-    # gsplat ya hace densification/pruning durante el training.
     log("Cleanup: gsplat ya pruneó outliers durante training. PLY conservado.")
     return ply_path
 
@@ -291,8 +362,6 @@ def gen_collision(ply_path, glb_path):
         log(f"WARN: Collision mesh falló ({e})", "WARN")
     return False
 
-# ── Encontrar PLY generado ────────────────────────────────────
-
 def find_ply(d):
     for root,_,files in os.walk(d):
         for f in files:
@@ -303,18 +372,6 @@ def find_ply(d):
 # ── HANDLER PRINCIPAL ─────────────────────────────────────────
 
 def handler(job):
-    """
-    Input esperado:
-      {"mode":"health"}  → health check
-      {
-        "download_url": "https://...",       # URL para descargar ZIP
-        "upload_url_ply": "https://...",      # URL para subir .ply resultado
-        "upload_url_glb": "https://...",      # URL para subir .glb colisión
-        "webhook_url": "https://...",         # URL del backend para notificar
-        "job_id": "xxx",                      # ID del job
-        "quality": "fast|balanced|quality",   # Calidad
-      }
-    """
     global log
     log = Log()
     t0 = time.time()
@@ -324,7 +381,6 @@ def handler(job):
         inp = job.get("input", {})
         log(f"=== JOB {job.get('id','?')} ===")
 
-        # Health check
         if inp.get("mode") == "health":
             import torch
             return {"status":"healthy",
@@ -333,7 +389,6 @@ def handler(job):
                     "torch": torch.__version__,
                     "seconds": round(time.time()-t0,1)}
 
-        # Validar input
         dl_url = inp.get("download_url") or inp.get("zip_url")
         if not dl_url:
             return {"status":"error","error":"Falta download_url/zip_url"}
@@ -348,7 +403,6 @@ def handler(job):
         webhook_url = inp.get("webhook_url")
         job_id = inp.get("job_id", job.get("id","unknown"))
 
-        # Directorios
         work = tempfile.mkdtemp(prefix="gs_")
         raw = os.path.join(work,"raw")
         frames = os.path.join(work,"frames")
@@ -358,11 +412,9 @@ def handler(job):
         result = os.path.join(work,"result")
         for d in [raw,frames,colmap,result]: os.makedirs(d, exist_ok=True)
 
-        # Descargar ZIP
         zip_path = os.path.join(work,"input.zip")
         download(dl_url, zip_path)
 
-        # Extraer
         log("Extrayendo ZIP...")
         with zipfile.ZipFile(zip_path,"r") as z: z.extractall(raw)
         os.remove(zip_path)
@@ -375,7 +427,6 @@ def handler(job):
                 for f in os.listdir(inner): shutil.move(os.path.join(inner,f),raw)
                 os.rmdir(inner)
             else: break
-        # Subcarpeta "images"
         if os.path.isdir(os.path.join(raw,"images")):
             for f in os.listdir(os.path.join(raw,"images")):
                 shutil.move(os.path.join(raw,"images",f),raw)
@@ -386,12 +437,12 @@ def handler(job):
         if count < MIN_IMGS:
             return {"status":"error","stage":"extraction","error":f"Solo {count} frames, mínimo {MIN_IMGS}"}
 
-        # ETAPA 2
+        # ETAPA 2 (FIX v2)
         kept = filter_blur(frames)
         if kept < MIN_IMGS:
-            return {"status":"error","stage":"blur","error":f"Solo {kept} frames nítidos, mínimo {MIN_IMGS}"}
+            return {"status":"error","stage":"blur","error":f"Solo {kept} frames nítidos tras filtro adaptativo, mínimo {MIN_IMGS}"}
 
-        # Limitar a MAX_IMGS si excede
+        # Limitar a MAX_IMGS
         all_frames = sorted([f for f in os.listdir(frames) if f.endswith(".jpg")])
         if len(all_frames) > MAX_IMGS:
             step = len(all_frames)/MAX_IMGS
@@ -401,10 +452,10 @@ def handler(job):
         final_count = len([f for f in os.listdir(frames) if f.endswith(".jpg")])
         log(f"Frames finales: {final_count}")
 
-        # ETAPA 3 (no fatal si falla)
+        # ETAPA 3
         gen_depth(frames, depth)
 
-        # ETAPA 4 (no fatal si falla)
+        # ETAPA 4
         gen_masks(frames, masks)
 
         # ETAPA 5
@@ -413,7 +464,6 @@ def handler(job):
         # ETAPA 6
         run_gsplat(colmap, result, iters)
 
-        # Encontrar PLY
         ply = find_ply(result)
         ply_mb = os.path.getsize(ply)/(1024*1024)
         log(f"PLY: {ply_mb:.1f} MB")
@@ -425,7 +475,6 @@ def handler(job):
         glb = os.path.join(result,"collision.glb")
         has_glb = gen_collision(ply, glb)
 
-        # Subir resultados a R2 si hay URLs
         if upload_ply_url:
             try: upload(ply, upload_ply_url)
             except Exception as e: log(f"WARN: Upload PLY falló ({e})", "WARN")
@@ -436,7 +485,6 @@ def handler(job):
 
         elapsed = round(time.time()-t0, 1)
 
-        # Resultado
         out = {
             "status":"success",
             "job_id": job_id,
@@ -450,13 +498,11 @@ def handler(job):
             "has_collision": has_glb,
         }
 
-        # Si no hay URL de upload, incluir PLY en base64 (solo si < 30MB)
         if not upload_ply_url and ply_mb < 30:
             with open(ply,"rb") as f: out["ply_base64"] = base64.b64encode(f.read()).decode()
         if not upload_glb_url and has_glb and os.path.getsize(glb)<5*1024*1024:
             with open(glb,"rb") as f: out["glb_base64"] = base64.b64encode(f.read()).decode()
 
-        # Webhook al backend
         if webhook_url:
             try:
                 req.post(webhook_url, json=out, timeout=30)
