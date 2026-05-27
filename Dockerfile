@@ -1,6 +1,11 @@
 FROM nvidia/cuda:12.1.0-cudnn8-devel-ubuntu22.04
 
 ENV DEBIAN_FRONTEND=noninteractive TZ=UTC PYTHONUNBUFFERED=1
+# Variables críticas para la compilación de kernels CUDA
+ENV PATH=/usr/local/cuda/bin:$PATH
+ENV LD_LIBRARY_PATH=/usr/local/cuda/lib64:$LD_LIBRARY_PATH
+ENV TORCH_CUDA_ARCH_LIST="7.5;8.0;8.6;8.9;9.0"
+ENV FORCE_CUDA="1"
 
 # Sistema base
 RUN apt-get update && apt-get install -y --no-install-recommends \
@@ -16,7 +21,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 
 RUN ln -sf /usr/bin/python3.10 /usr/bin/python && pip install --upgrade pip setuptools wheel
 
-# COLMAP 3.9.1 desde fuente (garantiza compatibilidad CUDA 12.1)
+# COLMAP 3.9.1 desde fuente
 RUN git clone --branch 3.9.1 --depth 1 https://github.com/colmap/colmap.git /tmp/colmap && \
     cd /tmp/colmap && mkdir build && cd build && \
     cmake .. -GNinja -DCMAKE_BUILD_TYPE=Release \
@@ -33,9 +38,8 @@ WORKDIR /workspace
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-# gsplat (compila kernels CUDA)
-ENV TORCH_CUDA_ARCH_LIST="7.5;8.0;8.6;8.9;9.0" MAX_JOBS=4
-RUN pip install --no-cache-dir gsplat==1.4.0 || pip install --no-cache-dir gsplat
+# FIX: Compilamos gsplat AQUÍ (durante el build)
+RUN pip install --no-cache-dir git+https://github.com/nerfstudio-project/gsplat.git
 
 # Trainer de gsplat (simple_trainer.py)
 RUN git clone --depth 1 https://github.com/nerfstudio-project/gsplat.git /opt/gsplat-repo && \
@@ -44,15 +48,13 @@ RUN git clone --depth 1 https://github.com/nerfstudio-project/gsplat.git /opt/gs
 # splat-transform para collision mesh
 RUN npm install -g @playcanvas/splat-transform 2>/dev/null || true
 
-# Pre-descargar modelos AI (evita descargas en cada job)
+# Pre-descargar modelos AI
 RUN python -c "from transformers import pipeline; \
-    p=pipeline('depth-estimation',model='depth-anything/Depth-Anything-V2-Small-hf'); \
-    print('Depth Anything V2 OK')" 2>/dev/null || true
+    p=pipeline('depth-estimation',model='depth-anything/Depth-Anything-V2-Small-hf');" 2>/dev/null || true
 
 RUN python -c "from transformers import Mask2FormerImageProcessor,Mask2FormerForUniversalSegmentation; \
     Mask2FormerImageProcessor.from_pretrained('facebook/mask2former-swin-base-ade-semantic'); \
-    Mask2FormerForUniversalSegmentation.from_pretrained('facebook/mask2former-swin-base-ade-semantic'); \
-    print('Mask2Former OK')" 2>/dev/null || true
+    Mask2FormerForUniversalSegmentation.from_pretrained('facebook/mask2former-swin-base-ade-semantic');" 2>/dev/null || true
 
 COPY handler.py .
 RUN mkdir -p /workspace/logs /workspace/jobs
