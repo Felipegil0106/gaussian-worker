@@ -1,22 +1,4 @@
-"""
-Worker GPU para Gaussian Splatting — Pipeline de 8 etapas
-Recibe ZIP de fotos, devuelve .ply + .glb (collision mesh)
 
-FIX v2 (2026-05-27): Filtro de blur ADAPTATIVO.
-  - El umbral fijo de 100 era inadecuado para fotos de móviles modernos.
-  - Ahora analizamos el set de fotos y usamos un umbral relativo al conjunto.
-  - Si TODAS las fotos serían rechazadas, mantenemos las mejores.
-
-Etapas:
-  1. Extracción inteligente de frames (FFmpeg mpdecimate)
-  2. Filtro de blur ADAPTATIVO (Laplacian variance + percentiles)
-  3. Depth Anything V2 (depth priors para paredes blancas)
-  4. Mask2Former (máscaras vidrios/espejos)
-  5. COLMAP (poses de cámara)
-  6. gsplat training (Gaussian Splatting)
-  7. Cleanup (statistical outlier removal)
-  8. splat-transform (collision mesh)
-"""
 
 import os, sys, json, shutil, subprocess, zipfile, tempfile, traceback, time, base64
 from pathlib import Path
