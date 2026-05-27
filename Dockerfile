@@ -1,61 +1,43 @@
 FROM nvidia/cuda:12.1.0-cudnn8-devel-ubuntu22.04
 
-ENV DEBIAN_FRONTEND=noninteractive TZ=UTC PYTHONUNBUFFERED=1
-# Variables críticas para la compilación de kernels CUDA
-ENV PATH=/usr/local/cuda/bin:$PATH
-ENV LD_LIBRARY_PATH=/usr/local/cuda/lib64:$LD_LIBRARY_PATH
-ENV TORCH_CUDA_ARCH_LIST="7.5;8.0;8.6;8.9;9.0"
+# 1. Asegurar variables críticas
+ENV DEBIAN_FRONTEND=noninteractive
+ENV PATH="/usr/local/cuda/bin:${PATH}"
 ENV FORCE_CUDA="1"
+ENV TORCH_CUDA_ARCH_LIST="7.5;8.0;8.6;8.9;9.0"
 
-# Sistema base
+# 2. Instalación de herramientas base (Git es prioridad)
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    python3.10 python3-pip python3.10-dev git wget curl unzip ffmpeg \
-    nodejs npm build-essential cmake ninja-build \
-    libgl1-mesa-glx libglib2.0-0 \
-    libboost-program-options-dev libboost-filesystem-dev \
-    libboost-graph-dev libboost-system-dev libeigen3-dev \
-    libflann-dev libfreeimage-dev libmetis-dev libgoogle-glog-dev \
-    libgtest-dev libsqlite3-dev libglew-dev qtbase5-dev \
-    libqt5opengl5-dev libcgal-dev libceres-dev \
+    git build-essential cmake ninja-build \
+    python3.10 python3-pip python3.10-dev \
+    ffmpeg libgl1-mesa-glx \
     && rm -rf /var/lib/apt/lists/*
 
-RUN ln -sf /usr/bin/python3.10 /usr/bin/python && pip install --upgrade pip setuptools wheel
+# 3. Verificar que git existe
+RUN git --version
 
-# COLMAP 3.9.1 desde fuente
-RUN git clone --branch 3.9.1 --depth 1 https://github.com/colmap/colmap.git /tmp/colmap && \
-    cd /tmp/colmap && mkdir build && cd build && \
-    cmake .. -GNinja -DCMAKE_BUILD_TYPE=Release \
-    -DCMAKE_CUDA_ARCHITECTURES="75;80;86;89;90" \
-    -DCMAKE_INSTALL_PREFIX=/usr/local && \
-    ninja -j$(nproc) && ninja install && rm -rf /tmp/colmap
+# 4. Preparar Python
+RUN ln -sf /usr/bin/python3.10 /usr/bin/python && \
+    pip install --upgrade pip setuptools wheel
 
-# PyTorch + CUDA 12.1
+# 5. Instalar PyTorch
 RUN pip install --no-cache-dir torch==2.1.2 torchvision==0.16.2 \
     --index-url https://download.pytorch.org/whl/cu121
 
-# Dependencias Python
+# 6. Instalar gsplat (Compilación robusta)
+# Instalamos ninja primero para acelerar la compilación
+RUN pip install --no-cache-dir ninja
+RUN pip install --no-cache-dir git+https://github.com/nerfstudio-project/gsplat.git
+
+# 7. Dependencias restantes
 WORKDIR /workspace
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-# FIX: Compilamos gsplat AQUÍ (durante el build)
-RUN pip install --no-cache-dir git+https://github.com/nerfstudio-project/gsplat.git
+# 8. Trainer de gsplat
+RUN git clone --depth 1 https://github.com/nerfstudio-project/gsplat.git /opt/gsplat-repo
 
-# Trainer de gsplat (simple_trainer.py)
-RUN git clone --depth 1 https://github.com/nerfstudio-project/gsplat.git /opt/gsplat-repo && \
-    pip install --no-cache-dir -r /opt/gsplat-repo/examples/requirements.txt 2>/dev/null || true
-
-# splat-transform para collision mesh
-RUN npm install -g @playcanvas/splat-transform 2>/dev/null || true
-
-# Pre-descargar modelos AI
-RUN python -c "from transformers import pipeline; \
-    p=pipeline('depth-estimation',model='depth-anything/Depth-Anything-V2-Small-hf');" 2>/dev/null || true
-
-RUN python -c "from transformers import Mask2FormerImageProcessor,Mask2FormerForUniversalSegmentation; \
-    Mask2FormerImageProcessor.from_pretrained('facebook/mask2former-swin-base-ade-semantic'); \
-    Mask2FormerForUniversalSegmentation.from_pretrained('facebook/mask2former-swin-base-ade-semantic');" 2>/dev/null || true
-
+# 9. Copiar el resto
 COPY handler.py .
 RUN mkdir -p /workspace/logs /workspace/jobs
 CMD ["python","-u","handler.py"]
