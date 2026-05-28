@@ -41,17 +41,23 @@ WORKDIR /workspace
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-# gsplat - intenta versión pin, fallback a último estable
-RUN pip install --no-cache-dir gsplat==1.4.0 || pip install --no-cache-dir gsplat
+# ════════════════════════════════════════════════════════════════
+# FIX CRÍTICO: gsplat librería Y trainer DEBEN ser la MISMA versión
+# Antes: pip instalaba 1.4.0 pero git clone traía 'main' (desajuste).
+# Ahora: ambos fijados al tag v1.4.0 exactamente.
+# ════════════════════════════════════════════════════════════════
 
-# Clonar repo gsplat para tener simple_trainer.py
-RUN git clone --depth 1 https://github.com/nerfstudio-project/gsplat.git /opt/gsplat-repo && \
-    pip install --no-cache-dir -r /opt/gsplat-repo/examples/requirements.txt 2>/dev/null || true
+# Clonar gsplat v1.4.0 EXACTO (tag) y instalarlo DESDE esa fuente
+RUN git clone --branch v1.4.0 --depth 1 \
+    https://github.com/nerfstudio-project/gsplat.git /opt/gsplat-repo && \
+    cd /opt/gsplat-repo && \
+    pip install --no-cache-dir . && \
+    pip install --no-cache-dir -r examples/requirements.txt
 
 # splat-transform para collision mesh
 RUN npm install -g @playcanvas/splat-transform 2>/dev/null || true
 
-# Pre-descargar modelos AI (evita descargas en cada job)
+# Pre-descargar modelos AI
 RUN python -c "from transformers import pipeline; \
     p=pipeline('depth-estimation',model='depth-anything/Depth-Anything-V2-Small-hf'); \
     print('Depth Anything V2 OK')" 2>/dev/null || true
