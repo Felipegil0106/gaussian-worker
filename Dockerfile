@@ -43,8 +43,6 @@ RUN pip install --no-cache-dir -r requirements.txt
 
 # ════════════════════════════════════════════════════════════════
 # FIX CRÍTICO DEL CTO: Separar la instalación de la clonación
-# 1. Instalamos gsplat 1.4.0 precompilado (evita build de C++).
-# 2. Clonamos v1.4.0 SOLO para traer simple_trainer.py y sus deps.
 # ════════════════════════════════════════════════════════════════
 
 # Instalar librería base directamente
@@ -59,12 +57,12 @@ RUN git clone --branch v1.4.0 --depth 1 \
 # splat-transform para collision mesh
 RUN npm install -g @playcanvas/splat-transform 2>/dev/null || true
 
-# Pre-descargar modelos AI
-RUN python -c "from transformers import pipeline; \
-    p=pipeline('depth-estimation',model='depth-anything/Depth-Anything-V2-Small-hf'); \
-    print('Depth Anything V2 OK')" 2>/dev/null || true
+# Pre-descargar modelos AI (FIX sintaxis bash aplicado)
+RUN python -c "from transformers import pipeline; p=pipeline('depth-estimation',model='depth-anything/Depth-Anything-V2-Small-hf'); print('Depth Anything V2 OK')" 2>/dev/null || true
 
-RUN python -c "from transformers import Mask2FormerImageProcessor,Mask2FormerForUniversalSegmentation; \
-    Mask2FormerImageProcessor.from_pretrained('facebook/mask2former-swin-base-ade-semantic'); \
-    Mask2FormerForUniversalSegmentation.from_pretrained('facebook/mask2former-swin-base-ade-semantic'); \
-    print('Mask2Former OK')" 2>/dev
+RUN python -c "from transformers import Mask2FormerImageProcessor,Mask2FormerForUniversalSegmentation; Mask2FormerImageProcessor.from_pretrained('facebook/mask2former-swin-base-ade-semantic'); Mask2FormerForUniversalSegmentation.from_pretrained('facebook/mask2former-swin-base-ade-semantic'); print('Mask2Former OK')" 2>/dev/null || true
+
+COPY handler.py .
+RUN mkdir -p /workspace/logs /workspace/jobs
+
+CMD ["python", "-u", "handler.py"]
