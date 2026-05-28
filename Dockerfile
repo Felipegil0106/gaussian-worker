@@ -42,16 +42,18 @@ COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
 # ════════════════════════════════════════════════════════════════
-# FIX CRÍTICO: gsplat librería Y trainer DEBEN ser la MISMA versión
-# Antes: pip instalaba 1.4.0 pero git clone traía 'main' (desajuste).
-# Ahora: ambos fijados al tag v1.4.0 exactamente.
+# FIX CRÍTICO DEL CTO: Separar la instalación de la clonación
+# 1. Instalamos gsplat 1.4.0 precompilado (evita build de C++).
+# 2. Clonamos v1.4.0 SOLO para traer simple_trainer.py y sus deps.
 # ════════════════════════════════════════════════════════════════
 
-# Clonar gsplat v1.4.0 EXACTO (tag) y instalarlo DESDE esa fuente
+# Instalar librería base directamente
+RUN pip install --no-cache-dir gsplat==1.4.0
+
+# Obtener scripts de entrenamiento
 RUN git clone --branch v1.4.0 --depth 1 \
     https://github.com/nerfstudio-project/gsplat.git /opt/gsplat-repo && \
     cd /opt/gsplat-repo && \
-    pip install --no-cache-dir . && \
     pip install --no-cache-dir -r examples/requirements.txt
 
 # splat-transform para collision mesh
