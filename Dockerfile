@@ -50,11 +50,11 @@ RUN pip install --no-cache-dir -r requirements.txt
 # Instalar librería base directamente
 RUN pip install --no-cache-dir gsplat==1.4.0
 
-# Obtener scripts de entrenamiento
+# Obtener scripts de entrenamiento y sus dependencias (FIX PEP 517 aplicado)
 RUN git clone --branch v1.4.0 --depth 1 \
     https://github.com/nerfstudio-project/gsplat.git /opt/gsplat-repo && \
     cd /opt/gsplat-repo && \
-    pip install --no-cache-dir -r examples/requirements.txt
+    pip install --no-cache-dir --no-build-isolation -r examples/requirements.txt
 
 # splat-transform para collision mesh
 RUN npm install -g @playcanvas/splat-transform 2>/dev/null || true
@@ -67,9 +67,4 @@ RUN python -c "from transformers import pipeline; \
 RUN python -c "from transformers import Mask2FormerImageProcessor,Mask2FormerForUniversalSegmentation; \
     Mask2FormerImageProcessor.from_pretrained('facebook/mask2former-swin-base-ade-semantic'); \
     Mask2FormerForUniversalSegmentation.from_pretrained('facebook/mask2former-swin-base-ade-semantic'); \
-    print('Mask2Former OK')" 2>/dev/null || true
-
-COPY handler.py .
-RUN mkdir -p /workspace/logs /workspace/jobs
-
-CMD ["python", "-u", "handler.py"]
+    print('Mask2Former OK')" 2>/dev
