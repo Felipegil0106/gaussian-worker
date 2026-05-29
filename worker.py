@@ -137,8 +137,17 @@ def heartbeat_loop():
 
 class Timeout(Exception): pass
 
-def run(cmd, timeout, name=""):
-    log(f"[{name}] " + " ".join(str(c) for c in cmd[:6]))
+def _has_xvfb():
+    """Detecta si xvfb-run está disponible (pantalla virtual para COLMAP)."""
+    return shutil.which("xvfb-run") is not None
+
+def run(cmd, timeout, name="", use_xvfb=False):
+    # FIX v3.8: COLMAP (Qt) necesita un display aunque corra headless.
+    # Sin pantalla, aborta con 'QGuiApplicationPrivate::createPlatformIntegration' rc=-6.
+    # xvfb-run crea una pantalla virtual en RAM y resuelve el crash.
+    if use_xvfb and _has_xvfb():
+        cmd = ["xvfb-run", "-a", "-s", "-screen 0 1280x1024x24"] + list(cmd)
+    log(f"[{name}] " + " ".join(str(c) for c in cmd[:8]))
     try:
         r = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout, check=False)
     except subprocess.TimeoutExpired:
@@ -317,16 +326,40 @@ def run_colmap():
     sparse = COLMAP_DIR / "sparse"
     db = COLMAP_DIR / "database.db"
     sparse.mkdir(exist_ok=True)
-    run(["colmap","feature_extractor",
-         "--database_path", str(db), "--image_path", str(FRAMES_DIR),
-         "--ImageReader.single_camera","1",
-         "--ImageReader.camera_model","OPENCV",
-         "--SiftExtraction.use_gpu","1"],
-        TIMEOUTS["colmap_feature"], "features")
-    run(["colmap","exhaustive_matcher",
-         "--database_path", str(db),
-         "--SiftMatching.use_gpu","1"],
-        TIMEOUTS["colmap_match"], "matching")
+
+    # FIX v3.8: COLMAP con SIFT en GPU inicializa OpenGL/Qt y necesita un display.
+    # Lo corremos bajo xvfb (pantalla virtual). Si la GPU SIFT falla igual,
+    # reintentamos con SIFT en CPU (use_gpu=0), que no toca Qt.
+    xvfb = _has_xvfb()
+    log(f"xvfb disponible: {xvfb}")
+    sift_gpu = "1" if xvfb else "0"  # sin xvfb, GPU SIFT crashea → usar CPU directo
+
+    try:
+        run(["colmap","feature_extractor",
+             "--database_path", str(db), "--image_path", str(FRAMES_DIR),
+             "--ImageReader.single_camera","1",
+             "--ImageReader.camera_model","OPENCV",
+             "--SiftExtraction.use_gpu", sift_gpu],
+            TIMEOUTS["colmap_feature"], "features", use_xvfb=xvfb)
+        run(["colmap","exhaustive_matcher",
+             "--database_path", str(db),
+             "--SiftMatching.use_gpu", sift_gpu],
+            TIMEOUTS["colmap_match"], "matching", use_xvfb=xvfb)
+    except RuntimeError as e:
+        # Fallback: reintentar TODO con SIFT en CPU (sin GPU, sin Qt)
+        log(f"COLMAP GPU falló ({e}); reintentando con SIFT en CPU...", "WARN")
+        if db.exists(): db.unlink()
+        run(["colmap","feature_extractor",
+             "--database_path", str(db), "--image_path", str(FRAMES_DIR),
+             "--ImageReader.single_camera","1",
+             "--ImageReader.camera_model","OPENCV",
+             "--SiftExtraction.use_gpu","0"],
+            TIMEOUTS["colmap_feature"], "features-cpu")
+        run(["colmap","exhaustive_matcher",
+             "--database_path", str(db),
+             "--SiftMatching.use_gpu","0"],
+            TIMEOUTS["colmap_match"], "matching-cpu")
+
     run(["colmap","mapper",
          "--database_path", str(db),
          "--image_path", str(FRAMES_DIR),
