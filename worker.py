@@ -410,16 +410,20 @@ def main():
     log(f"=== JOB {TOUR_ID} (calidad={QUALITY}) ===")
 
     # Primer heartbeat: confirmar que el backend nos oye antes de gastar GPU
-    log("Primer heartbeat...")
-    for attempt in range(3):
+    # FIX BUG 2: hasta 15 intentos × 5s = 75s (suficiente para que el backend
+    # commitee el job en DB después de POST /api/jobs)
+    log("Primer heartbeat... (puede tardar hasta 75s si el backend está despertando)")
+    backend_ok = False
+    for attempt in range(15):
         if callback({"type":"progress","progress":0.0,
                      "message":"Pod arrancó, preparando..."}):
-            log("Backend OK")
+            log(f"Backend OK al intento {attempt+1}")
+            backend_ok = True
             break
-        log(f"Heartbeat falló ({attempt+1}/3)", "WARN")
-        time.sleep(3)
-    else:
-        log("CRITICAL: backend no responde. Abortando.", "ERROR")
+        log(f"Heartbeat falló ({attempt+1}/15), reintento en 5s...", "WARN")
+        time.sleep(5)
+    if not backend_ok:
+        log("CRITICAL: backend no responde tras 75s. Abortando.", "ERROR")
         sys.exit(1)
 
     hb = threading.Thread(target=heartbeat_loop, daemon=True)
