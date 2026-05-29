@@ -328,8 +328,11 @@ def run_colmap():
     sparse.mkdir(exist_ok=True)
 
     # FIX v3.8: COLMAP con SIFT en GPU inicializa OpenGL/Qt y necesita un display.
-    # Lo corremos bajo xvfb (pantalla virtual). Si la GPU SIFT falla igual,
-    # reintentamos con SIFT en CPU (use_gpu=0), que no toca Qt.
+    # Lo corremos bajo xvfb (pantalla virtual) para el feature_extractor.
+    # FIX v3.10: el exhaustive_matcher con GPU bajo xvfb SE CUELGA en silencio
+    # (no crashea, no avanza → Timeout 900s). Por eso el matcher va SIEMPRE en CPU,
+    # que con ~50-80 fotos es rápido (~1-2 min) y nunca se cuelga.
+    # El feature_extractor con GPU sí funciona bien (~20s), así que ese queda en GPU.
     xvfb = _has_xvfb()
     log(f"xvfb disponible: {xvfb}")
     sift_gpu = "1" if xvfb else "0"  # sin xvfb, GPU SIFT crashea → usar CPU directo
@@ -341,13 +344,15 @@ def run_colmap():
              "--ImageReader.camera_model","OPENCV",
              "--SiftExtraction.use_gpu", sift_gpu],
             TIMEOUTS["colmap_feature"], "features", use_xvfb=xvfb)
+        # Matcher SIEMPRE en CPU (use_gpu=0): evita el cuelgue de GPU+xvfb.
         run(["colmap","exhaustive_matcher",
              "--database_path", str(db),
-             "--SiftMatching.use_gpu", sift_gpu],
-            TIMEOUTS["colmap_match"], "matching", use_xvfb=xvfb)
-    except RuntimeError as e:
-        # Fallback: reintentar TODO con SIFT en CPU (sin GPU, sin Qt)
-        log(f"COLMAP GPU falló ({e}); reintentando con SIFT en CPU...", "WARN")
+             "--SiftMatching.use_gpu","0"],
+            TIMEOUTS["colmap_match"], "matching-cpu")
+    except (RuntimeError, Timeout) as e:
+        # Fallback: reintentar TODO con SIFT en CPU (sin GPU, sin Qt).
+        # Ahora atrapa también Timeout, no solo RuntimeError.
+        log(f"COLMAP falló ({e}); reintentando TODO con SIFT en CPU...", "WARN")
         if db.exists(): db.unlink()
         run(["colmap","feature_extractor",
              "--database_path", str(db), "--image_path", str(FRAMES_DIR),
@@ -358,7 +363,7 @@ def run_colmap():
         run(["colmap","exhaustive_matcher",
              "--database_path", str(db),
              "--SiftMatching.use_gpu","0"],
-            TIMEOUTS["colmap_match"], "matching-cpu")
+            TIMEOUTS["colmap_match"], "matching-cpu2")
 
     run(["colmap","mapper",
          "--database_path", str(db),
