@@ -252,7 +252,11 @@ def gen_depth():
     log("━━━ ETAPA 3: Depth Anything V2 ━━━")
     DEPTH_DIR.mkdir(exist_ok=True)
     try:
-        import torch
+        import torch  # noqa
+    except ImportError:
+        log("WARN: torch no disponible, saltando Depth (opcional)", "WARN")
+        return
+    try:
         from PIL import Image
         from transformers import pipeline
         device = "cuda" if torch.cuda.is_available() else "cpu"
@@ -312,29 +316,62 @@ def gen_masks():
 # ETAPA 5: COLMAP
 # ══════════════════════════════════════════════════════════════
 
+def _has_xvfb():
+    """¿Está disponible xvfb-run (pantalla virtual)?"""
+    try:
+        subprocess.run(["which", "xvfb-run"], check=True, capture_output=True)
+        return True
+    except Exception:
+        return False
+
 def run_colmap():
+    """COLMAP con SIFT en GPU vía xvfb (pantalla virtual). 
+    COLMAP requiere un display aunque corra headless; xvfb lo provee.
+    Si xvfb no está, cae a SIFT en CPU (más lento pero sin display)."""
     log("━━━ ETAPA 5: COLMAP ━━━")
     sparse = COLMAP_DIR / "sparse"
     db = COLMAP_DIR / "database.db"
     sparse.mkdir(exist_ok=True)
-    run(["colmap","feature_extractor",
+
+    use_xvfb = _has_xvfb()
+    if use_xvfb:
+        # Con pantalla virtual → SIFT en GPU (rápido)
+        xvfb = ["xvfb-run", "-a", "--server-args=-screen 0 1280x1024x24"]
+        sift_gpu = "1"
+        log("COLMAP: usando xvfb (pantalla virtual) + SIFT GPU")
+    else:
+        # Sin xvfb → SIFT en CPU (no necesita display)
+        xvfb = []
+        sift_gpu = "0"
+        log("COLMAP: sin xvfb, SIFT en CPU (más lento)")
+
+    # Feature extraction
+    run(xvfb + ["colmap","feature_extractor",
          "--database_path", str(db), "--image_path", str(FRAMES_DIR),
          "--ImageReader.single_camera","1",
          "--ImageReader.camera_model","OPENCV",
-         "--SiftExtraction.use_gpu","1"],
+         "--SiftExtraction.use_gpu", sift_gpu,
+         "--SiftExtraction.max_num_features","8192"],
         TIMEOUTS["colmap_feature"], "features")
-    run(["colmap","exhaustive_matcher",
+
+    # Matching
+    run(xvfb + ["colmap","exhaustive_matcher",
          "--database_path", str(db),
-         "--SiftMatching.use_gpu","1"],
+         "--SiftMatching.use_gpu", sift_gpu],
         TIMEOUTS["colmap_match"], "matching")
+
+    # Mapper (no necesita GPU/display)
     run(["colmap","mapper",
          "--database_path", str(db),
          "--image_path", str(FRAMES_DIR),
          "--output_path", str(sparse)],
         TIMEOUTS["colmap_mapper"], "mapper")
+
     s0 = sparse / "0"
     if not s0.exists():
-        raise RuntimeError("COLMAP no reconstruyó. Fotos con poca textura o overlap.")
+        raise RuntimeError("COLMAP no reconstruyó. Fotos con poca textura o poco overlap entre ellas.")
+
+    # Undistort
     run(["colmap","image_undistorter",
          "--image_path", str(FRAMES_DIR),
          "--input_path", str(s0),
@@ -557,4 +594,4 @@ def main():
         sys.exit(1)
 
 if __name__ == "__main__":
-    main()
+    main()s
