@@ -425,11 +425,16 @@ def run_openmvs():
         raise RuntimeError("InterfaceCOLMAP no generó scene.mvs")
 
     # ── Paso 6.2: DensifyPointCloud → nube densa (USA CUDA, paso pesado) ──
+    # CALIDAD: resolution-level 1 (mitad de resolución) genera MUCHOS más
+    # puntos que level 2, dando una malla completa en vez de con huecos.
+    # number-views 4 combina varias vistas por punto (más robusto y denso).
     log("OpenMVS 2/5: DensifyPointCloud (nube densa, usa GPU)...")
     run(["DensifyPointCloud",
          "scene.mvs",
-         "--resolution-level", "2",
-         "--number-views", "0"],
+         "--resolution-level", "1",
+         "--min-resolution", "640",
+         "--number-views", "4",
+         "--fusion-mode", "0"],
         TIMEOUTS["mvs_densify"], "mvs_densify", cwd=str(mvs_dir))
     dense = _find_first(mvs_dir, ["scene_dense.mvs", "scene.mvs"])
     if dense is None:
@@ -437,8 +442,11 @@ def run_openmvs():
     log(f"   nube densa: {dense.name}")
 
     # ── Paso 6.3: ReconstructMesh → malla de triángulos ──
+    # CALIDAD: --close-holes cierra agujeros pequeños; --smooth suaviza.
     log("OpenMVS 3/5: ReconstructMesh (creando malla)...")
-    run(["ReconstructMesh", dense.name],
+    run(["ReconstructMesh", dense.name,
+         "--close-holes", "30",
+         "--smooth", "2"],
         TIMEOUTS["mvs_mesh"], "mvs_mesh", cwd=str(mvs_dir))
     mesh = _find_first(mvs_dir, [
         "scene_dense_mesh.ply", "scene_mesh.ply", "scene_dense.ply"])
