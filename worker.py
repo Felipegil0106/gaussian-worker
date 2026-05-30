@@ -349,6 +349,9 @@ def run_colmap():
              "--database_path", str(db), "--image_path", str(FRAMES_DIR),
              "--ImageReader.single_camera","1",
              "--ImageReader.camera_model","OPENCV",
+             # OPTIMIZACIÓN: limitar features por foto (def. 8192 → 4096).
+             # 4096 es generoso (suficiente detalle) y acelera matching+mapper.
+             "--SiftExtraction.max_num_features","4096",
              "--SiftExtraction.use_gpu", sift_gpu],
             TIMEOUTS["colmap_feature"], "features", use_xvfb=xvfb)
         # Matcher SIEMPRE en CPU (use_gpu=0): evita el cuelgue de GPU+xvfb.
@@ -365,6 +368,7 @@ def run_colmap():
              "--database_path", str(db), "--image_path", str(FRAMES_DIR),
              "--ImageReader.single_camera","1",
              "--ImageReader.camera_model","OPENCV",
+             "--SiftExtraction.max_num_features","4096",
              "--SiftExtraction.use_gpu","0"],
             TIMEOUTS["colmap_feature"], "features-cpu")
         run(["colmap","exhaustive_matcher",
@@ -454,31 +458,50 @@ def run_openmvs():
         raise RuntimeError("ReconstructMesh no generó la malla")
     log(f"   malla cruda: {mesh.name}")
 
-    # ── Paso 6.4: RefineMesh → suaviza/mejora (OPCIONAL, no romper si falla) ──
+    # ── Paso 6.4: RefineMesh → suaviza/mejora ──
+    # OPTIMIZACIÓN: desactivado por defecto. En pruebas tardaba ~4.5 min y NO
+    # dejaba archivo útil (la malla cruda ya es buena para nuestro caso).
+    # Para reactivarlo, pon USAR_REFINE_MESH = True abajo.
+    USAR_REFINE_MESH = False
     refined = mesh
-    try:
-        log("OpenMVS 4/5: RefineMesh (mejorando malla, opcional)...")
-        run(["RefineMesh", dense.name,
-             "-m", mesh.name,
-             "--resolution-level", "1"],
-            TIMEOUTS["mvs_refine"], "mvs_refine", cwd=str(mvs_dir))
-        r = _find_first(mvs_dir, [
-            mesh.stem + "_refine.ply", "scene_dense_mesh_refine.ply"])
-        if r is not None:
-            refined = r
-            log(f"   malla refinada: {refined.name}")
-        else:
-            log("   RefineMesh no dejó archivo nuevo; uso la malla cruda", "WARN")
-    except (RuntimeError, Timeout) as e:
-        log(f"   RefineMesh falló ({e}); sigo con la malla sin refinar", "WARN")
+    if USAR_REFINE_MESH:
+        try:
+            log("OpenMVS 4/5: RefineMesh (mejorando malla, opcional)...")
+            run(["RefineMesh", dense.name,
+                 "-m", mesh.name,
+                 "--resolution-level", "1"],
+                TIMEOUTS["mvs_refine"], "mvs_refine", cwd=str(mvs_dir))
+            r = _find_first(mvs_dir, [
+                mesh.stem + "_refine.ply", "scene_dense_mesh_refine.ply"])
+            if r is not None:
+                refined = r
+                log(f"   malla refinada: {refined.name}")
+            else:
+                log("   RefineMesh no dejó archivo nuevo; uso la malla cruda", "WARN")
+        except (RuntimeError, Timeout) as e:
+            log(f"   RefineMesh falló ({e}); sigo con la malla sin refinar", "WARN")
+    else:
+        log("OpenMVS 4/5: RefineMesh OMITIDO (optimización; la malla cruda basta)")
 
     # ── Paso 6.5: TextureMesh → pega las fotos sobre la malla → .obj final ──
+    # --export-type obj genera scene_textured.obj + .mtl + textura .png.
+    # --empty-color 0 evita que las zonas sin foto queden negras (las deja
+    #   en un color neutro), ayudando a que NO se vea todo negro.
     log("OpenMVS 5/5: TextureMesh (pegando fotos = textura)...")
     run(["TextureMesh", dense.name,
          "-m", refined.name,
          "--export-type", "obj",
+         "--empty-color", "0",
          "-o", "scene_textured.obj"],
         TIMEOUTS["mvs_texture"], "mvs_texture", cwd=str(mvs_dir))
+
+    # Diagnóstico: listar TODO lo que generó TextureMesh (clave para depurar)
+    try:
+        generados = sorted(os.listdir(str(mvs_dir)))
+        log(f"   TextureMesh generó: {generados}")
+    except Exception:
+        pass
+
     textured = _find_first(mvs_dir, [
         "scene_textured.obj", refined.stem + "_texture.obj",
         "scene_dense_mesh_refine_texture.obj", "scene_dense_mesh_texture.obj"])
@@ -493,15 +516,71 @@ def run_openmvs():
 
 def convert_mesh_to_glb(obj_path, glb_path):
     """Carga el .obj texturizado de OpenMVS (con su .mtl y textura) y lo
-    exporta como .glb, que es un solo archivo con la geometría + textura
-    embebida, ideal para visores web y móvil."""
+    exporta como .glb con la textura EMBEBIDA.
+
+    Robusto ante los detalles de OpenMVS:
+      - Hace 'cd' a la carpeta del .obj para que trimesh halle el .mtl y la
+        textura por ruta relativa (causa #1 de mallas sin textura).
+      - Si trimesh devuelve una Scene con varias geometrías, las concatena.
+      - Verifica que la textura quedó incrustada; si no, avisa en el log.
+    """
     import trimesh
-    log(f"Convirtiendo malla a .glb: {os.path.basename(obj_path)}")
-    # trimesh carga el .obj junto con su material (.mtl) y la textura.
-    scene = trimesh.load(obj_path, process=False)
-    scene.export(glb_path)
+    obj_path = os.path.abspath(obj_path)
+    obj_dir = os.path.dirname(obj_path)
+    obj_name = os.path.basename(obj_path)
+    glb_path = os.path.abspath(glb_path)
+
+    log(f"Convirtiendo malla a .glb: {obj_name}")
+
+    # Listar lo que dejó OpenMVS, para diagnóstico (texturas, mtl, etc.)
+    try:
+        archivos = os.listdir(obj_dir)
+        texturas = [f for f in archivos if f.lower().endswith((".png", ".jpg", ".jpeg"))]
+        mtls = [f for f in archivos if f.lower().endswith(".mtl")]
+        log(f"   en carpeta: {len(texturas)} textura(s) {texturas[:3]}, {len(mtls)} .mtl")
+    except Exception:
+        pass
+
+    # CLAVE: cargar DESDE la carpeta del .obj (rutas relativas del .mtl)
+    cwd_anterior = os.getcwd()
+    try:
+        os.chdir(obj_dir)
+        # resolver=True ayuda a que trimesh resuelva texturas referenciadas
+        loaded = trimesh.load(obj_name, process=False)
+    finally:
+        os.chdir(cwd_anterior)
+
+    # trimesh puede devolver un Trimesh o una Scene (varias geometrías)
+    if isinstance(loaded, trimesh.Scene):
+        if len(loaded.geometry) == 0:
+            raise RuntimeError("La malla cargada no tiene geometría")
+        export_obj = loaded  # exportar la escena completa (conserva materiales)
+    else:
+        export_obj = loaded
+
+    # Exportar a glb (incrusta geometría + textura en un solo archivo)
+    export_obj.export(glb_path, file_type="glb")
     mb = os.path.getsize(glb_path) / (1024 * 1024)
     log(f"GLB generado: {mb:.1f} MB")
+
+    # Verificar si la textura quedó incrustada (diagnóstico en el log)
+    try:
+        check = trimesh.load(glb_path)
+        geoms = check.geometry.values() if hasattr(check, "geometry") else [check]
+        tiene_tex = False
+        for g in geoms:
+            mat = getattr(getattr(g, "visual", None), "material", None)
+            if mat is not None:
+                img = getattr(mat, "image", None) or getattr(mat, "baseColorTexture", None)
+                if img is not None:
+                    tiene_tex = True
+        if tiene_tex:
+            log("   ✓ Textura incrustada correctamente en el .glb")
+        else:
+            log("   ⚠ El .glb NO tiene textura incrustada (malla saldrá sin color)", "WARN")
+    except Exception as e:
+        log(f"   (no se pudo verificar textura: {e})", "WARN")
+
     return glb_path
 
 # ══════════════════════════════════════════════════════════════
