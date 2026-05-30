@@ -1,23 +1,27 @@
 #!/usr/bin/env python3
 """
-Gaussian Worker v3 — Pod-Standalone Edition
+Gaussian Worker v4 — MALLA (OpenMVS) Edition
 ═══════════════════════════════════════════════════════════════════
-ES tu handler.py de siempre (gsplat 1.4.0, 8 etapas COMPLETAS) pero
-re-empaquetado para ejecutarse dentro de un POD RunPod en lugar de
-Serverless.
+Genera una MALLA TEXTURIZADA (tipo Polycam) en vez de un splat.
+Corre dentro de un POD RunPod/Vast usando la imagen propia
+'felipegil0106/gaussian-mesh:v1' que trae COLMAP + OpenMVS precompilados.
 
-CAMBIOS vs handler.py:
+PIPELINE (malla):
+  1. Extracción de frames
+  2. Filtro de blur adaptativo
+  (3 y 4 Depth/Masks: OMITIDAS — OpenMVS hace su propia densa)
+  5. COLMAP (posiciones de cámara + undistort)
+  6. OpenMVS: InterfaceCOLMAP → DensifyPointCloud → ReconstructMesh
+     → RefineMesh (opcional) → TextureMesh → .obj texturizado
+  7. Convertir .obj → .glb (formato para móvil/visores) y subir
+
+CARACTERÍSTICAS:
   - Lee parámetros desde env vars (no de un dict 'job')
   - Manda callbacks HMAC al backend (progress, completed, error)
   - Heartbeat cada 30s
   - En error, manda el LOG COMPLETO al backend (descargable después)
-  - Es un script con main(), no una función handler() de RunPod
-
-NO CAMBIA (sigue idéntico a tu handler.py):
-  - Las 8 etapas del pipeline
-  - El filtro adaptativo de blur
-  - gsplat v1.4.0 con simple_trainer del MISMO tag (sin bug color_correct)
-  - Depth Anything V2 + Mask2Former
+  - El código de gsplat/depth/masks sigue presente pero NO se usa
+    (por si se quiere reactivar el modo splat en el futuro)
   - COLMAP 3.9.x desde apt
 """
 
@@ -46,6 +50,9 @@ TIMEOUTS = {
     "download":600, "colmap_feature":600, "colmap_match":900,
     "colmap_mapper":1800, "colmap_undistort":300,
     "gsplat":2700, "collision":600, "upload":600,
+    # OpenMVS (malla): DensifyPointCloud es el paso pesado
+    "mvs_interface":300, "mvs_densify":2400, "mvs_mesh":1200,
+    "mvs_refine":1800, "mvs_texture":900,
 }
 ITERS = {"fast":7000, "balanced":30000, "quality":50000}
 
@@ -141,7 +148,7 @@ def _has_xvfb():
     """Detecta si xvfb-run está disponible (pantalla virtual para COLMAP)."""
     return shutil.which("xvfb-run") is not None
 
-def run(cmd, timeout, name="", use_xvfb=False):
+def run(cmd, timeout, name="", use_xvfb=False, cwd=None):
     # FIX v3.8: COLMAP (Qt) necesita un display aunque corra headless.
     # Sin pantalla, aborta con 'QGuiApplicationPrivate::createPlatformIntegration' rc=-6.
     # xvfb-run crea una pantalla virtual en RAM y resuelve el crash.
@@ -149,7 +156,7 @@ def run(cmd, timeout, name="", use_xvfb=False):
         cmd = ["xvfb-run", "-a", "-s", "-screen 0 1280x1024x24"] + list(cmd)
     log(f"[{name}] " + " ".join(str(c) for c in cmd[:8]))
     try:
-        r = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout, check=False)
+        r = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout, check=False, cwd=cwd)
     except subprocess.TimeoutExpired:
         raise Timeout(f"Timeout {name} ({timeout}s)")
     if r.returncode != 0:
@@ -382,7 +389,115 @@ def run_colmap():
     log("COLMAP OK")
 
 # ══════════════════════════════════════════════════════════════
-# ETAPA 6: GSPLAT TRAINING
+# ETAPA 6 (MALLA): OpenMVS  →  reemplaza a gsplat
+# Cadena: InterfaceCOLMAP → DensifyPointCloud → ReconstructMesh
+#         → RefineMesh (opcional) → TextureMesh → .obj texturizado
+# ══════════════════════════════════════════════════════════════
+
+def _find_first(folder, patterns):
+    """Busca el primer archivo que exista entre varios nombres posibles."""
+    for p in patterns:
+        cand = Path(folder) / p
+        if cand.exists() and cand.stat().st_size > 0:
+            return cand
+    return None
+
+def run_openmvs():
+    """Genera una malla texturizada con OpenMVS a partir de la salida de COLMAP.
+    Los binarios viven en /usr/local/bin/OpenMVS (ya en PATH dentro de la imagen)."""
+    log("━━━ ETAPA 6: OpenMVS (malla texturizada) ━━━")
+
+    mvs_dir = RESULT_DIR / "mvs"
+    mvs_dir.mkdir(parents=True, exist_ok=True)
+
+    # COLMAP dejó images/ y sparse/ dentro de COLMAP_DIR (output_type=COLMAP).
+    # InterfaceCOLMAP lee esa estructura y crea el proyecto .mvs.
+    # Importante: las imágenes están en COLMAP_DIR/images.
+
+    # ── Paso 6.1: InterfaceCOLMAP → scene.mvs ──
+    log("OpenMVS 1/5: InterfaceCOLMAP (importando salida de COLMAP)...")
+    run(["InterfaceCOLMAP",
+         "-i", str(COLMAP_DIR),
+         "-o", str(mvs_dir / "scene.mvs"),
+         "--image-folder", str(COLMAP_DIR / "images")],
+        TIMEOUTS["mvs_interface"], "mvs_interface")
+    if not (mvs_dir / "scene.mvs").exists():
+        raise RuntimeError("InterfaceCOLMAP no generó scene.mvs")
+
+    # ── Paso 6.2: DensifyPointCloud → nube densa (USA CUDA, paso pesado) ──
+    log("OpenMVS 2/5: DensifyPointCloud (nube densa, usa GPU)...")
+    run(["DensifyPointCloud",
+         "scene.mvs",
+         "--resolution-level", "2",
+         "--number-views", "0"],
+        TIMEOUTS["mvs_densify"], "mvs_densify", cwd=str(mvs_dir))
+    dense = _find_first(mvs_dir, ["scene_dense.mvs", "scene.mvs"])
+    if dense is None:
+        raise RuntimeError("DensifyPointCloud no generó nube densa")
+    log(f"   nube densa: {dense.name}")
+
+    # ── Paso 6.3: ReconstructMesh → malla de triángulos ──
+    log("OpenMVS 3/5: ReconstructMesh (creando malla)...")
+    run(["ReconstructMesh", dense.name],
+        TIMEOUTS["mvs_mesh"], "mvs_mesh", cwd=str(mvs_dir))
+    mesh = _find_first(mvs_dir, [
+        "scene_dense_mesh.ply", "scene_mesh.ply", "scene_dense.ply"])
+    if mesh is None:
+        raise RuntimeError("ReconstructMesh no generó la malla")
+    log(f"   malla cruda: {mesh.name}")
+
+    # ── Paso 6.4: RefineMesh → suaviza/mejora (OPCIONAL, no romper si falla) ──
+    refined = mesh
+    try:
+        log("OpenMVS 4/5: RefineMesh (mejorando malla, opcional)...")
+        run(["RefineMesh", dense.name,
+             "-m", mesh.name,
+             "--resolution-level", "1"],
+            TIMEOUTS["mvs_refine"], "mvs_refine", cwd=str(mvs_dir))
+        r = _find_first(mvs_dir, [
+            mesh.stem + "_refine.ply", "scene_dense_mesh_refine.ply"])
+        if r is not None:
+            refined = r
+            log(f"   malla refinada: {refined.name}")
+        else:
+            log("   RefineMesh no dejó archivo nuevo; uso la malla cruda", "WARN")
+    except (RuntimeError, Timeout) as e:
+        log(f"   RefineMesh falló ({e}); sigo con la malla sin refinar", "WARN")
+
+    # ── Paso 6.5: TextureMesh → pega las fotos sobre la malla → .obj final ──
+    log("OpenMVS 5/5: TextureMesh (pegando fotos = textura)...")
+    run(["TextureMesh", dense.name,
+         "-m", refined.name,
+         "--export-type", "obj",
+         "-o", "scene_textured.obj"],
+        TIMEOUTS["mvs_texture"], "mvs_texture", cwd=str(mvs_dir))
+    textured = _find_first(mvs_dir, [
+        "scene_textured.obj", refined.stem + "_texture.obj",
+        "scene_dense_mesh_refine_texture.obj", "scene_dense_mesh_texture.obj"])
+    if textured is None:
+        raise RuntimeError("TextureMesh no generó el .obj texturizado")
+    log(f"OpenMVS OK → malla texturizada: {textured.name}")
+    return str(textured)
+
+# ══════════════════════════════════════════════════════════════
+# ETAPA 7 (MALLA): convertir .obj texturizado → .glb (para móvil/visores)
+# ══════════════════════════════════════════════════════════════
+
+def convert_mesh_to_glb(obj_path, glb_path):
+    """Carga el .obj texturizado de OpenMVS (con su .mtl y textura) y lo
+    exporta como .glb, que es un solo archivo con la geometría + textura
+    embebida, ideal para visores web y móvil."""
+    import trimesh
+    log(f"Convirtiendo malla a .glb: {os.path.basename(obj_path)}")
+    # trimesh carga el .obj junto con su material (.mtl) y la textura.
+    scene = trimesh.load(obj_path, process=False)
+    scene.export(glb_path)
+    mb = os.path.getsize(glb_path) / (1024 * 1024)
+    log(f"GLB generado: {mb:.1f} MB")
+    return glb_path
+
+# ══════════════════════════════════════════════════════════════
+# ETAPA 6 (SPLAT — LEGADO): GSPLAT TRAINING (ya no se usa por defecto)
 # ══════════════════════════════════════════════════════════════
 
 def run_gsplat(iters):
@@ -603,44 +718,35 @@ def main():
                     os.remove(str(FRAMES_DIR / f))
         final_count = len([f for f in os.listdir(FRAMES_DIR) if f.endswith(".jpg")])
 
-        # ETAPA 3
-        report(0.30, "Depth Anything V2")
-        gen_depth()
+        # ETAPA 3 y 4 (Depth, Masks): NO se usan para la malla.
+        # OpenMVS calcula su propia profundidad densa, así que las saltamos.
+        # Esto ADEMÁS acelera el proceso (menos pasos).
+        # (El código de gen_depth/gen_masks sigue en el archivo por si algún
+        #  día se reactivan, pero aquí no se llaman.)
+        log("Etapas Depth/Masks omitidas (no se requieren para malla)")
 
-        # ETAPA 4
-        report(0.40, "Mask2Former")
-        gen_masks()
-
-        # ETAPA 5
-        report(0.50, "COLMAP")
+        # ETAPA 5: COLMAP (ubica las cámaras — base para OpenMVS)
+        report(0.45, "COLMAP (posiciones de cámara)")
         run_colmap()
 
-        # ETAPA 6
-        report(0.65, f"gsplat training ({iters} iter)")
-        run_gsplat(iters)
+        # ETAPA 6: OpenMVS (genera la malla texturizada)
+        report(0.60, "OpenMVS (construyendo malla)")
+        obj_path = run_openmvs()
 
-        ply_path = find_ply()
-        ply_mb = os.path.getsize(ply_path) / (1024 * 1024)
-        log(f"PLY: {ply_mb:.1f} MB")
+        # ETAPA 7: convertir la malla a .glb
+        report(0.92, "Convirtiendo malla a .glb")
+        glb_path = str(RESULT_DIR / "scene.glb")
+        convert_mesh_to_glb(obj_path, glb_path)
+        glb_mb = os.path.getsize(glb_path) / (1024 * 1024)
+        log(f"GLB final: {glb_mb:.1f} MB")
 
-        # ETAPA 7
-        report(0.93, "Cleanup")
-        ply_path = cleanup_ply(ply_path)
-
-        # ETAPA 8
-        report(0.95, "Collision mesh")
-        glb_path = str(RESULT_DIR / "collision.glb")
-        has_glb = gen_collision(ply_path, glb_path)
-
-        # Subir
-        report(0.97, "Subiendo .ply a R2...")
-        upload(ply_path, UPLOAD_URL_PLY)
-        if has_glb and UPLOAD_URL_GLB:
-            try:
-                report(0.99, "Subiendo .glb a R2...")
-                upload(glb_path, UPLOAD_URL_GLB)
-            except Exception as e:
-                log(f"WARN upload .glb falló: {e}", "WARN")
+        # Subir la malla .glb (este es ahora el entregable principal)
+        report(0.97, "Subiendo malla .glb...")
+        # El backend manda UPLOAD_URL_GLB para la malla. Si por compatibilidad
+        # solo viene UPLOAD_URL_PLY, subimos el .glb por esa URL igual.
+        upload_url = UPLOAD_URL_GLB if UPLOAD_URL_GLB else UPLOAD_URL_PLY
+        upload(glb_path, upload_url)
+        has_glb = True
 
         _keep_heartbeat = False
         elapsed = round(time.time() - _t0, 1)
@@ -650,11 +756,11 @@ def main():
             "type": "completed",
             "frames_total": count,
             "frames_used": final_count,
-            "ply_mb": round(ply_mb, 2),
+            "glb_mb": round(glb_mb, 2),
+            "mesh": True,
             "has_collision": has_glb,
             "seconds": elapsed,
             "quality": QUALITY,
-            "iterations": iters,
         }
         for _ in range(5):
             if callback(success):
