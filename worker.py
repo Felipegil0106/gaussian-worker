@@ -446,10 +446,16 @@ def run_openmvs():
     log(f"   nube densa: {dense.name}")
 
     # ── Paso 6.3: ReconstructMesh → malla de triángulos ──
-    # CALIDAD: --close-holes cierra agujeros pequeños; --smooth suaviza.
-    log("OpenMVS 3/5: ReconstructMesh (creando malla)...")
+    # CLAVE para evitar la malla negra: NO rellenar agujeros grandes con
+    # geometría inventada (que queda sin textura = negra).
+    #   --close-holes 0   → no inventa relleno en agujeros grandes
+    #   --remove-spurious 30 → borra trozos de malla flotantes/basura
+    #   --smooth 2        → suaviza un poco
+    # Así la malla cubre SOLO lo que las fotos vieron de verdad → todo con textura.
+    log("OpenMVS 3/5: ReconstructMesh (creando malla, sin relleno negro)...")
     run(["ReconstructMesh", dense.name,
-         "--close-holes", "30",
+         "--close-holes", "0",
+         "--remove-spurious", "30",
          "--smooth", "2"],
         TIMEOUTS["mvs_mesh"], "mvs_mesh", cwd=str(mvs_dir))
     mesh = _find_first(mvs_dir, [
@@ -485,13 +491,16 @@ def run_openmvs():
 
     # ── Paso 6.5: TextureMesh → pega las fotos sobre la malla → .obj final ──
     # --export-type obj genera scene_textured.obj + .mtl + textura .png.
-    # --empty-color 0 evita que las zonas sin foto queden negras (las deja
-    #   en un color neutro), ayudando a que NO se vea todo negro.
+    # --max-texture-size 4096 limita la textura a 4K: archivo liviano (~15 MB
+    #   vs ~62 MB) que carga bien en móvil/web, casi sin pérdida de calidad.
+    # NOTA: NO usamos --empty-color (un valor 0 pinta de NEGRO las zonas sin
+    #   foto, y la malla quedaba casi toda negra). Sin el parámetro, OpenMVS
+    #   usa su relleno por defecto, que se ve mucho mejor.
     log("OpenMVS 5/5: TextureMesh (pegando fotos = textura)...")
     run(["TextureMesh", dense.name,
          "-m", refined.name,
          "--export-type", "obj",
-         "--empty-color", "0",
+         "--max-texture-size", "4096",
          "-o", "scene_textured.obj"],
         TIMEOUTS["mvs_texture"], "mvs_texture", cwd=str(mvs_dir))
 
@@ -848,6 +857,9 @@ def main():
             "has_collision": has_glb,
             "seconds": elapsed,
             "quality": QUALITY,
+            # Enviar el LOG completo también en éxito, para poder revisarlo
+            # después aunque la GPU ya se haya apagado.
+            "log": full_log(),
         }
         for _ in range(5):
             if callback(success):
