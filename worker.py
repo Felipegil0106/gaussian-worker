@@ -408,11 +408,96 @@ def run_gsplat(iters):
     log("gsplat OK")
 
 def find_ply():
+    """gsplat 1.4.0 NO genera .ply: guarda un checkpoint .pt en result/ckpts/.
+    Esta función localiza ese checkpoint y lo CONVIERTE a .ply estándar de
+    Gaussian Splatting (el formato que abre SuperSplat, Polycam, etc.).
+    """
+    # 1) Si por lo que sea ya hay un .ply, úsalo.
     for root, _, files in os.walk(str(RESULT_DIR)):
         for f in files:
             if f.endswith(".ply"):
+                log(f"PLY encontrado directamente: {f}")
                 return os.path.join(root, f)
-    raise RuntimeError(f"No se generó PLY en {RESULT_DIR}")
+
+    # 2) Buscar el checkpoint .pt más avanzado (mayor número de step).
+    ckpts = []
+    for root, _, files in os.walk(str(RESULT_DIR)):
+        for f in files:
+            if f.endswith(".pt"):
+                ckpts.append(os.path.join(root, f))
+    if not ckpts:
+        raise RuntimeError(
+            f"gsplat no dejó ni .ply ni checkpoint .pt en {RESULT_DIR}. "
+            f"El entrenamiento no guardó nada.")
+
+    def _step_of(path):
+        # nombres tipo ckpt_6999_rank0.pt → 6999
+        import re
+        m = re.search(r"ckpt_(\d+)", os.path.basename(path))
+        return int(m.group(1)) if m else 0
+    ckpt_path = sorted(ckpts, key=_step_of)[-1]
+    log(f"Convirtiendo checkpoint a PLY: {os.path.basename(ckpt_path)}")
+
+    ply_path = str(RESULT_DIR / "scene.ply")
+    _convert_ckpt_to_ply(ckpt_path, ply_path)
+    return ply_path
+
+
+def _convert_ckpt_to_ply(ckpt_path, ply_path):
+    """Lee un checkpoint de gsplat y escribe un .ply estándar de 3DGS."""
+    import torch
+    from plyfile import PlyData, PlyElement
+
+    ckpt = torch.load(ckpt_path, map_location="cpu")
+    splats = ckpt["splats"] if "splats" in ckpt else ckpt
+    # splats es un state_dict con: means, scales, quats, opacities, sh0, shN
+    def _get(name):
+        if name not in splats:
+            raise RuntimeError(f"Checkpoint sin campo '{name}'. Campos: {list(splats.keys())}")
+        return splats[name].detach().cpu().numpy()
+
+    means = _get("means").astype(np.float32)            # (N,3)
+    scales = _get("scales").astype(np.float32)           # (N,3) en log-espacio
+    quats = _get("quats").astype(np.float32)             # (N,4)
+    opacities = _get("opacities").astype(np.float32).reshape(-1, 1)  # (N,1) logit
+    sh0 = _get("sh0").astype(np.float32)                 # (N,1,3) DC
+    shN = splats.get("shN", None)                        # (N,K,3) resto (opcional)
+
+    N = means.shape[0]
+    log(f"Gaussianos en el modelo: {N}")
+
+    # sh0 viene como (N,1,3) → aplanar a (N,3) para f_dc_0..2
+    f_dc = sh0.reshape(N, -1)                            # (N,3)
+    # shN viene como (N,K,3) → aplanar a (N, K*3) en orden [coef, canal]
+    if shN is not None:
+        shN = shN.detach().cpu().numpy().astype(np.float32)
+        f_rest = shN.reshape(N, -1)                      # (N, K*3)
+    else:
+        f_rest = np.zeros((N, 0), dtype=np.float32)
+
+    # Nombres de columnas estándar de 3DGS (los que esperan los visores)
+    cols = ["x", "y", "z", "nx", "ny", "nz"]
+    f_dc_names = [f"f_dc_{i}" for i in range(f_dc.shape[1])]
+    f_rest_names = [f"f_rest_{i}" for i in range(f_rest.shape[1])]
+    cols += f_dc_names + f_rest_names
+    cols += ["opacity"]
+    cols += [f"scale_{i}" for i in range(scales.shape[1])]
+    cols += [f"rot_{i}" for i in range(quats.shape[1])]
+
+    normals = np.zeros((N, 3), dtype=np.float32)
+    data = np.concatenate(
+        [means, normals, f_dc, f_rest, opacities, scales, quats], axis=1
+    ).astype(np.float32)
+
+    dtype = [(c, "f4") for c in cols]
+    verts = np.empty(N, dtype=dtype)
+    for i, c in enumerate(cols):
+        verts[c] = data[:, i]
+
+    el = PlyElement.describe(verts, "vertex")
+    PlyData([el], byte_order="<").write(ply_path)
+    size_mb = os.path.getsize(ply_path) / 1024**2
+    log(f"PLY escrito: {ply_path} ({size_mb:.1f} MB, {N} gaussianos)")
 
 # ══════════════════════════════════════════════════════════════
 # ETAPA 7: CLEANUP (gsplat ya prunea internamente)
