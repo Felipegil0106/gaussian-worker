@@ -676,6 +676,11 @@ def rellenar_negro_texturas(obj_dir):
         img = cv2.imread(tex_path)
         if img is None:
             continue
+        # Tamaño ORIGINAL — hay que conservarlo EXACTO (el .obj/.mtl y las UV lo
+        # esperan). Si cambia o el JPG sale corrupto, el .glb pierde la textura
+        # (sale blanco). Guardamos una copia de respaldo por si la IA falla.
+        h0, w0 = img.shape[:2]
+        img_original = img.copy()
         gris = img.sum(axis=2)
         mask = (gris < 30).astype(np.uint8) * 255
         negro_pct = (mask > 0).sum() / mask.size * 100
@@ -686,14 +691,35 @@ def rellenar_negro_texturas(obj_dir):
             # ── PASO A: relleno natural con LaMa (si hay zonas sin foto) ──
             if negro_pct >= 0.5:
                 mask_d = cv2.dilate(mask, np.ones((5, 5), np.uint8))
-                resultado = aplicar_lama(img, mask_d)  # si falla → para todo
+                out = aplicar_lama(img, mask_d)  # si falla → para todo
+                resultado = out
                 log(f"   LaMa: {os.path.basename(tex_path)} {negro_pct:.0f}% sin foto → relleno natural (IA)")
             # ── PASO B: nitidez con Real-ESRGAN ──
             mejor = aplicar_esrgan(resultado)  # si falla → para todo
-            h, w = resultado.shape[:2]
-            resultado = cv2.resize(mejor, (w, h), interpolation=cv2.INTER_AREA)
+            resultado = mejor
             log(f"   Real-ESRGAN: {os.path.basename(tex_path)} → más nítida (IA)")
-            cv2.imwrite(tex_path, resultado)
+
+            # ── NORMALIZAR antes de guardar (clave para que NO salga blanco) ──
+            # 1) asegurar uint8 0-255 (ESRGAN puede devolver float o >255)
+            resultado = np.clip(resultado, 0, 255).astype(np.uint8)
+            # 2) asegurar 3 canales BGR
+            if resultado.ndim == 2:
+                resultado = cv2.cvtColor(resultado, cv2.COLOR_GRAY2BGR)
+            if resultado.shape[2] == 4:
+                resultado = cv2.cvtColor(resultado, cv2.COLOR_BGRA2BGR)
+            # 3) tamaño EXACTO al original (LaMa/ESRGAN lo cambian)
+            if resultado.shape[:2] != (h0, w0):
+                resultado = cv2.resize(resultado, (w0, h0), interpolation=cv2.INTER_AREA)
+            # 4) guardar JPG de alta calidad con el MISMO nombre
+            cv2.imwrite(tex_path, resultado, [cv2.IMWRITE_JPEG_QUALITY, 95])
+
+            # ── VERIFICACIÓN DE SEGURIDAD: releer la textura guardada ──
+            # Si quedó corrupta o de otro tamaño, restaurar la ORIGINAL (mejor
+            # tener la textura sin IA que un render blanco sin textura).
+            check = cv2.imread(tex_path)
+            if check is None or check.shape[:2] != (h0, w0):
+                cv2.imwrite(tex_path, img_original, [cv2.IMWRITE_JPEG_QUALITY, 95])
+                log(f"   ⚠ textura IA quedó mal; restaurada la original (sin IA)", "WARN")
             procesadas += 1
         else:
             # ── Método casero (solo si la IA está desactivada) ──
