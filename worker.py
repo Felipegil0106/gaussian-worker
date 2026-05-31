@@ -495,16 +495,19 @@ def run_openmvs():
 
     # ── Paso 6.5: TextureMesh → pega las fotos sobre la malla → .obj final ──
     # --export-type obj genera scene_textured.obj + .mtl + textura .png.
-    # --max-texture-size 4096 limita la textura a 4K: archivo liviano (~15 MB
-    #   vs ~62 MB) que carga bien en móvil/web, casi sin pérdida de calidad.
-    # NOTA: NO usamos --empty-color (un valor 0 pinta de NEGRO las zonas sin
-    #   foto, y la malla quedaba casi toda negra). Sin el parámetro, OpenMVS
-    #   usa su relleno por defecto, que se ve mucho mejor.
-    log("OpenMVS 5/5: TextureMesh (pegando fotos = textura)...")
+    # --max-texture-size 4096 → archivo liviano (~15 MB) que carga bien.
+    # CLAVE para que NO salga oscura (Polycam tiene brillo 130, el nuestro 33):
+    #   --global-seam-leveling 1  → iguala el brillo/color entre fotos vecinas
+    #   --local-seam-leveling 1   → suaviza costuras locales
+    #   --patch-packing-heuristic 1 → mejor empaquetado de la textura
+    # Esto imita la corrección de iluminación que hace Polycam.
+    log("OpenMVS 5/5: TextureMesh (pegando fotos + corrección de luz)...")
     run(["TextureMesh", dense.name,
          "-m", refined.name,
          "--export-type", "obj",
          "--max-texture-size", "4096",
+         "--global-seam-leveling", "1",
+         "--local-seam-leveling", "1",
          "-o", "scene_textured.obj"],
         TIMEOUTS["mvs_texture"], "mvs_texture", cwd=str(mvs_dir))
 
