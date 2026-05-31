@@ -548,10 +548,12 @@ def run_openmvs():
 
 def rellenar_negro_texturas(obj_dir):
     """POST-PROCESO (la técnica de Polycam para que NO haya negro):
-    Recorre las texturas .jpg/.png que generó OpenMVS y rellena las zonas
-    NEGRAS (sin foto) con el color de los píxeles vecinos (inpainting).
-    Así, donde OpenMVS dejó negro, queda un color que continúa la imagen,
-    igual que hace Polycam. Devuelve cuántas texturas procesó.
+    Recorre las texturas que generó OpenMVS y rellena las zonas NEGRAS
+    (sin foto). Usa dos estrategias según el tamaño del hueco:
+      - Huecos PEQUEÑOS → inpainting normal (reconstruye bien el detalle).
+      - Huecos GRANDES → relleno SUAVE/borroso (evita el efecto 'cristalizado'
+        que produce estirar los bordes en huecos grandes).
+    Devuelve cuántas texturas procesó.
     """
     import glob
     try:
@@ -570,18 +572,32 @@ def rellenar_negro_texturas(obj_dir):
             img = cv2.imread(tex_path)
             if img is None:
                 continue
-            # Máscara de píxeles "negros" (suma de canales muy baja = sin foto)
             gris = img.sum(axis=2)
             mask = (gris < 30).astype(np.uint8) * 255
             negro_pct = (mask > 0).sum() / mask.size * 100
             if negro_pct < 0.5:
-                continue  # casi no hay negro, no hace falta
-            # Inpainting: rellena el negro con el color de alrededor.
-            # Radio 5 px, método TELEA (rápido y bueno para texturas).
-            reparada = cv2.inpaint(img, mask, 5, cv2.INPAINT_TELEA)
-            cv2.imwrite(tex_path, reparada)
+                continue
+
+            # 1) Inpainting base (Navier-Stokes, rellena con continuidad)
+            base = cv2.inpaint(img, mask, 3, cv2.INPAINT_NS)
+
+            # 2) Versión SUAVE para huecos grandes: desenfoque fuerte sobre el
+            #    relleno, para que las zonas sin foto se vean como un borrón
+            #    neutro (NO cristales/abanicos).
+            suave = cv2.GaussianBlur(base, (51, 51), 0)
+
+            # 3) Separar huecos grandes de pequeños con apertura morfológica.
+            #    Lo que sobrevive a la erosión fuerte = hueco grande.
+            kernel = np.ones((25, 25), np.uint8)
+            huecos_grandes = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel)
+            huecos_grandes_3 = cv2.cvtColor(huecos_grandes, cv2.COLOR_GRAY2BGR) > 0
+
+            # Resultado: detalle del inpaint en general, pero borrón suave en
+            # los huecos grandes (donde el inpaint haría cristales).
+            resultado = np.where(huecos_grandes_3, suave, base)
+            cv2.imwrite(tex_path, resultado)
             procesadas += 1
-            log(f"   inpainting: {os.path.basename(tex_path)} tenía {negro_pct:.0f}% negro → rellenado")
+            log(f"   inpainting: {os.path.basename(tex_path)} tenía {negro_pct:.0f}% negro → rellenado (suave en huecos grandes)")
         except Exception as e:
             log(f"   (inpainting falló en {os.path.basename(tex_path)}: {e})", "WARN")
     return procesadas
