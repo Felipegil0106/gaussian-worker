@@ -451,16 +451,19 @@ def run_openmvs():
 
     # ── Paso 6.3: ReconstructMesh → malla de triángulos ──
     # RECONSTRUCCIÓN (estudiando Polycam: malla LIMPIA, CERRADA, ~500K vért):
-    #   --close-holes 30   → CIERRA agujeros pequeños/medianos. Polycam tiene la
-    #                        malla cerrada; los agujeros abiertos causan que el
-    #                        texturizador deje negro alrededor (auto-oclusión).
-    #   --remove-spurious 40 → borra basura flotante, pero MENOS agresivo (80
-    #                        borraba demasiado y abría huecos).
-    #   --smooth 3         → suaviza picos (menos auto-sombra → menos negro).
-    log("OpenMVS 3/5: ReconstructMesh (malla cerrada tipo Polycam)...")
+    #   --close-holes 30   → CIERRA agujeros (menos auto-oclusión = menos negro).
+    #   --remove-spurious 40 → borra basura flotante sin abrir huecos.
+    #   --decimate 0.4     → reduce las caras al 40%. CLAVE contra el PIXELADO:
+    #                        la malla tenía 2.4M vértices = miles de parches
+    #                        diminutos = textura rayada/mosaico. Bajándola a
+    #                        ~500K (como Polycam) los parches son GRANDES y la
+    #                        textura se ve continua y nítida.
+    #   --smooth 3         → suaviza picos.
+    log("OpenMVS 3/5: ReconstructMesh (malla cerrada + simplificada)...")
     run(["ReconstructMesh", dense.name,
          "--close-holes", "30",
          "--remove-spurious", "40",
+         "--decimate", "0.4",
          "--smooth", "3"],
         TIMEOUTS["mvs_mesh"], "mvs_mesh", cwd=str(mvs_dir))
     mesh = _find_first(mvs_dir, [
@@ -468,6 +471,14 @@ def run_openmvs():
     if mesh is None:
         raise RuntimeError("ReconstructMesh no generó la malla")
     log(f"   malla cruda: {mesh.name}")
+    # Diagnóstico: contar vértices de la malla (para ver si bajó el pixelado)
+    try:
+        import trimesh as _tm
+        _m = _tm.load(str(mesh), process=False)
+        nv = len(_m.vertices) if hasattr(_m, "vertices") else 0
+        log(f"   malla: ~{nv:,} vértices (objetivo: ~500K para textura nítida)")
+    except Exception:
+        pass
 
     # ── Paso 6.4: RefineMesh → suaviza/mejora ──
     # OPTIMIZACIÓN: desactivado por defecto. En pruebas tardaba ~4.5 min y NO
