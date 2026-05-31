@@ -830,7 +830,14 @@ def convert_mesh_to_glb(obj_path, glb_path):
                 img_path = texturas_disponibles[0]
             if not img_path or not os.path.exists(img_path):
                 continue
-            pil = Image.open(img_path).convert("RGB")
+            # FIX del error "'JpegImageFile' object has no attribute '_im'":
+            # PIL abre la imagen de forma "perezosa" (sin decodificar píxeles),
+            # y trimesh falla al exportarla. Recrear la imagen desde un array
+            # numpy fuerza la decodificación y entrega una imagen "limpia".
+            import numpy as _np
+            _tmp = Image.open(img_path).convert("RGB")
+            pil = Image.fromarray(_np.asarray(_tmp))
+            pil.load()  # garantiza que los píxeles están en memoria
             # Crear un material PBR nuevo con la textura pegada
             nuevo = trimesh.visual.material.PBRMaterial(
                 baseColorTexture=pil,
