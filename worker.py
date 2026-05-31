@@ -450,33 +450,31 @@ def run_openmvs():
     log(f"   nube densa: {dense.name}")
 
     # ── Paso 6.3: ReconstructMesh → malla de triángulos ──
-    # RECONSTRUCCIÓN (estudiando Polycam: malla LIMPIA, CERRADA, ~500K vért):
-    #   --close-holes 30   → CIERRA agujeros (menos auto-oclusión = menos negro).
-    #   --remove-spurious 40 → borra basura flotante sin abrir huecos.
-    #   --decimate 0.4     → reduce las caras al 40%. CLAVE contra el PIXELADO:
-    #                        la malla tenía 2.4M vértices = miles de parches
-    #                        diminutos = textura rayada/mosaico. Bajándola a
-    #                        ~500K (como Polycam) los parches son GRANDES y la
-    #                        textura se ve continua y nítida.
-    #   --smooth 3         → suaviza picos.
-    log("OpenMVS 3/5: ReconstructMesh (malla cerrada + simplificada)...")
+    # CONTRA LAS FACETAS/HEXÁGONOS (el efecto cristalizado):
+    # Las facetas son caras planas grandes en zonas mal vistas. Para reducirlas:
+    #   --close-holes 100  → rellena MUCHO más con superficie continua (no deja
+    #                        huecos que se vuelvan facetas planas).
+    #   --smooth 5         → suaviza FUERTE (funde las facetas en superficie
+    #                        continua, como el aspecto continuo de Polycam).
+    #   --remove-spurious 30 → limpieza suave (no abrir huecos).
+    #   SIN --decimate: simplificar creaba caras grandes planas = MÁS facetas
+    #                   visibles. Dejamos la malla densa para superficie suave.
+    log("OpenMVS 3/5: ReconstructMesh (malla suave, anti-facetas)...")
     run(["ReconstructMesh", dense.name,
-         "--close-holes", "30",
-         "--remove-spurious", "40",
-         "--decimate", "0.4",
-         "--smooth", "3"],
+         "--close-holes", "100",
+         "--remove-spurious", "30",
+         "--smooth", "5"],
         TIMEOUTS["mvs_mesh"], "mvs_mesh", cwd=str(mvs_dir))
     mesh = _find_first(mvs_dir, [
         "scene_dense_mesh.ply", "scene_mesh.ply", "scene_dense.ply"])
     if mesh is None:
         raise RuntimeError("ReconstructMesh no generó la malla")
     log(f"   malla cruda: {mesh.name}")
-    # Diagnóstico: contar vértices de la malla (para ver si bajó el pixelado)
     try:
         import trimesh as _tm
         _m = _tm.load(str(mesh), process=False)
         nv = len(_m.vertices) if hasattr(_m, "vertices") else 0
-        log(f"   malla: ~{nv:,} vértices (objetivo: ~500K para textura nítida)")
+        log(f"   malla: ~{nv:,} vértices")
     except Exception:
         pass
 
