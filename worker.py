@@ -541,16 +541,116 @@ def run_openmvs():
     return str(textured)
 
 # ══════════════════════════════════════════════════════════════
+# ETAPA 6.6 (MALLA): IA para relleno natural (LaMa) y nitidez (Real-ESRGAN)
+# ══════════════════════════════════════════════════════════════
+# Estas dos IAs imitan lo que hace Polycam:
+#   - LaMa: rellena las zonas sin foto de forma NATURAL y continua (mata las
+#     facetas/hexágonos), en vez del relleno borroso casero.
+#   - Real-ESRGAN: sube la nitidez de la textura (súper-resolución con IA).
+# COMPORTAMIENTO PEDIDO: si la IA falla (instalación o ejecución), el worker
+# PARA TODO de inmediato y manda el log del error al backend (para descargarlo),
+# en vez de seguir con el método casero. Así se ataca el problema apenas surge.
+# Para volver al modo casero sin IA, pon USAR_IA = False.
+
+USAR_IA = True  # True = usar IA y PARAR si falla; False = método casero sin IA
+
+# Cache global de modelos (para no recargarlos por cada textura)
+_LAMA_MODEL = None
+_ESRGAN_MODEL = None
+
+
+def _instalar_dependencias_ia():
+    """Instala (si faltan) las librerías de IA. Se llama una sola vez.
+    Si algo NO se puede instalar, LANZA una excepción (el worker parará y
+    mandará el log, según lo pedido: atacar el problema apenas surja).
+    No forzamos versión de torch si la imagen ya lo trae (para no romper CUDA)."""
+    global _LAMA_MODEL, _ESRGAN_MODEL
+    tiene_torch = False
+    try:
+        import torch  # noqa
+        tiene_torch = True
+    except Exception:
+        log("   IA: torch no está; intentando instalar (puede tardar 1-3 min)...")
+        ultimo_error = None
+        for args in (
+            ["torch", "torchvision", "--index-url",
+             "https://download.pytorch.org/whl/cu121"],
+            ["torch", "torchvision"],
+        ):
+            try:
+                subprocess.run([sys.executable, "-m", "pip", "install",
+                                "--quiet"] + args, check=True, timeout=1200)
+                tiene_torch = True
+                break
+            except Exception as e:
+                ultimo_error = e
+                log(f"   IA: intento de instalar torch falló ({e})", "WARN")
+        if not tiene_torch:
+            raise RuntimeError(f"No se pudo instalar torch para la IA: {ultimo_error}")
+    # simple-lama-inpainting (LaMa) y realesrgan + basicsr
+    for paquete, imp in [("simple-lama-inpainting", "simple_lama_inpainting"),
+                         ("realesrgan", "realesrgan"),
+                         ("basicsr", "basicsr")]:
+        try:
+            __import__(imp)
+        except Exception:
+            log(f"   IA: instalando {paquete}...")
+            try:
+                subprocess.run([sys.executable, "-m", "pip", "install",
+                                "--quiet", paquete], check=True, timeout=600)
+                __import__(imp)  # verificar que ahora sí importa
+            except Exception as e:
+                raise RuntimeError(f"No se pudo instalar/importar {paquete} para la IA: {e}")
+    return True
+
+
+def aplicar_lama(img_bgr, mask):
+    """Rellena con LaMa (IA) las zonas marcadas en 'mask' (255 = rellenar).
+    Recibe y devuelve imagen BGR (de cv2).
+    Si LaMa falla, LANZA una excepción (el worker parará y mandará el log)."""
+    global _LAMA_MODEL
+    import numpy as np
+    from PIL import Image
+    if _LAMA_MODEL is None:
+        from simple_lama_inpainting import SimpleLama
+        _LAMA_MODEL = SimpleLama()  # descarga el modelo la 1ª vez
+    rgb = Image.fromarray(img_bgr[:, :, ::-1])
+    m = Image.fromarray(mask).convert("L")
+    out = _LAMA_MODEL(rgb, m)  # devuelve PIL RGB rellenado
+    out_np = np.array(out)
+    return out_np[:, :, ::-1]  # de vuelta a BGR
+
+
+def aplicar_esrgan(img_bgr):
+    """Sube la nitidez de la imagen con Real-ESRGAN (IA). Devuelve la imagen
+    mejorada (puede venir más grande).
+    Si falla, LANZA una excepción (el worker parará y mandará el log)."""
+    global _ESRGAN_MODEL
+    if _ESRGAN_MODEL is None:
+        from realesrgan import RealESRGANer
+        from basicsr.archs.rrdbnet_arch import RRDBNet
+        modelo = RRDBNet(num_in_ch=3, num_out_ch=3, num_feat=64,
+                         num_block=23, num_grow_ch=32, scale=4)
+        _ESRGAN_MODEL = RealESRGANer(
+            scale=4,
+            model_path=("https://github.com/xinntao/Real-ESRGAN/releases/"
+                        "download/v0.1.0/RealESRGAN_x4plus.pth"),
+            model=modelo, tile=512, tile_pad=10, pre_pad=0, half=True)
+    salida, _ = _ESRGAN_MODEL.enhance(img_bgr, outscale=2)
+    return salida
+
+
+# ══════════════════════════════════════════════════════════════
 # ETAPA 7 (MALLA): convertir .obj texturizado → .glb (para móvil/visores)
 # ══════════════════════════════════════════════════════════════
 
 def rellenar_negro_texturas(obj_dir):
-    """POST-PROCESO (la técnica de Polycam para que NO haya negro):
-    Recorre las texturas que generó OpenMVS y rellena las zonas NEGRAS
-    (sin foto). Usa dos estrategias según el tamaño del hueco:
-      - Huecos PEQUEÑOS → inpainting normal (reconstruye bien el detalle).
-      - Huecos GRANDES → relleno SUAVE/borroso (evita el efecto 'cristalizado'
-        que produce estirar los bordes en huecos grandes).
+    """POST-PROCESO (imita a Polycam para que NO haya negro ni facetas):
+    En las zonas NEGRAS (sin foto) de cada textura:
+      - Si USAR_IA: usa LaMa (relleno natural) + Real-ESRGAN (nitidez). Si la IA
+        falla, NO usa respaldo: deja subir el error para PARAR el job y que
+        puedas descargar el log (atacar el problema apenas surja).
+      - Si USAR_IA es False: usa el método casero (inpainting + borrón suave).
     Devuelve cuántas texturas procesó.
     """
     import glob
@@ -558,46 +658,56 @@ def rellenar_negro_texturas(obj_dir):
         import cv2
         import numpy as np
     except Exception as e:
-        log(f"   (inpainting no disponible: {e}; sigo sin rellenar)", "WARN")
+        if USAR_IA:
+            raise RuntimeError(f"OpenCV no disponible para el post-proceso: {e}")
+        log(f"   (post-proceso no disponible: {e}; sigo sin rellenar)", "WARN")
         return 0
+
+    # Preparar IA una sola vez (si está activada). Si falla, LANZA excepción.
+    if USAR_IA:
+        _instalar_dependencias_ia()
+        log("   IA lista (LaMa + Real-ESRGAN); procesando texturas...")
 
     texturas = []
     for ext in ("*.jpg", "*.jpeg", "*.png"):
         texturas.extend(glob.glob(os.path.join(obj_dir, ext)))
     procesadas = 0
     for tex_path in texturas:
-        try:
-            img = cv2.imread(tex_path)
-            if img is None:
-                continue
-            gris = img.sum(axis=2)
-            mask = (gris < 30).astype(np.uint8) * 255
-            negro_pct = (mask > 0).sum() / mask.size * 100
-            if negro_pct < 0.5:
-                continue
+        img = cv2.imread(tex_path)
+        if img is None:
+            continue
+        gris = img.sum(axis=2)
+        mask = (gris < 30).astype(np.uint8) * 255
+        negro_pct = (mask > 0).sum() / mask.size * 100
 
-            # 1) Inpainting base (Navier-Stokes, rellena con continuidad)
-            base = cv2.inpaint(img, mask, 3, cv2.INPAINT_NS)
+        resultado = img
 
-            # 2) Versión SUAVE para huecos grandes: desenfoque fuerte sobre el
-            #    relleno, para que las zonas sin foto se vean como un borrón
-            #    neutro (NO cristales/abanicos).
-            suave = cv2.GaussianBlur(base, (51, 51), 0)
-
-            # 3) Separar huecos grandes de pequeños con apertura morfológica.
-            #    Lo que sobrevive a la erosión fuerte = hueco grande.
-            kernel = np.ones((25, 25), np.uint8)
-            huecos_grandes = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel)
-            huecos_grandes_3 = cv2.cvtColor(huecos_grandes, cv2.COLOR_GRAY2BGR) > 0
-
-            # Resultado: detalle del inpaint en general, pero borrón suave en
-            # los huecos grandes (donde el inpaint haría cristales).
-            resultado = np.where(huecos_grandes_3, suave, base)
+        if USAR_IA:
+            # ── PASO A: relleno natural con LaMa (si hay zonas sin foto) ──
+            if negro_pct >= 0.5:
+                mask_d = cv2.dilate(mask, np.ones((5, 5), np.uint8))
+                resultado = aplicar_lama(img, mask_d)  # si falla → para todo
+                log(f"   LaMa: {os.path.basename(tex_path)} {negro_pct:.0f}% sin foto → relleno natural (IA)")
+            # ── PASO B: nitidez con Real-ESRGAN ──
+            mejor = aplicar_esrgan(resultado)  # si falla → para todo
+            h, w = resultado.shape[:2]
+            resultado = cv2.resize(mejor, (w, h), interpolation=cv2.INTER_AREA)
+            log(f"   Real-ESRGAN: {os.path.basename(tex_path)} → más nítida (IA)")
             cv2.imwrite(tex_path, resultado)
             procesadas += 1
-            log(f"   inpainting: {os.path.basename(tex_path)} tenía {negro_pct:.0f}% negro → rellenado (suave en huecos grandes)")
-        except Exception as e:
-            log(f"   (inpainting falló en {os.path.basename(tex_path)}: {e})", "WARN")
+        else:
+            # ── Método casero (solo si la IA está desactivada) ──
+            if negro_pct < 0.5:
+                continue
+            base = cv2.inpaint(img, mask, 3, cv2.INPAINT_NS)
+            suave = cv2.GaussianBlur(base, (51, 51), 0)
+            kernel = np.ones((25, 25), np.uint8)
+            grandes = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel)
+            grandes3 = cv2.cvtColor(grandes, cv2.COLOR_GRAY2BGR) > 0
+            resultado = np.where(grandes3, suave, base)
+            cv2.imwrite(tex_path, resultado)
+            procesadas += 1
+            log(f"   inpainting casero: {os.path.basename(tex_path)} {negro_pct:.0f}% → rellenado")
     return procesadas
 
 
