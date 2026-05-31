@@ -738,16 +738,17 @@ def rellenar_negro_texturas(obj_dir):
 
 
 def convert_mesh_to_glb(obj_path, glb_path):
-    """Carga el .obj texturizado de OpenMVS (con su .mtl y textura) y lo
-    exporta como .glb con la textura EMBEBIDA.
+    """Carga el .obj texturizado de OpenMVS y lo exporta como .glb con la
+    textura EMBEBIDA.
 
-    Robusto ante los detalles de OpenMVS:
-      - Hace 'cd' a la carpeta del .obj para que trimesh halle el .mtl y la
-        textura por ruta relativa (causa #1 de mallas sin textura).
-      - Si trimesh devuelve una Scene con varias geometrías, las concatena.
-      - Verifica que la textura quedó incrustada; si no, avisa en el log.
+    IMPORTANTE (arreglo del render BLANCO): después del post-proceso con IA,
+    trimesh a veces NO logra enlazar la textura del .mtl y el material queda
+    blanco. Por eso, tras cargar, FORZAMOS la textura manualmente sobre cada
+    geometría (leyendo el .mtl para emparejar material↔imagen). Así el color
+    NO depende de que trimesh resuelva el .mtl por su cuenta.
     """
     import trimesh
+    from PIL import Image
     obj_path = os.path.abspath(obj_path)
     obj_dir = os.path.dirname(obj_path)
     obj_name = os.path.basename(obj_path)
@@ -764,27 +765,83 @@ def convert_mesh_to_glb(obj_path, glb_path):
     except Exception:
         pass
 
-    # POST-PROCESO clave: rellenar las zonas negras de las texturas (anti-negro)
+    # POST-PROCESO clave: rellenar/IA sobre las texturas (anti-negro, anti-facetas)
     n = rellenar_negro_texturas(obj_dir)
     if n:
-        log(f"   ✓ {n} textura(s) con zonas negras rellenadas (estilo Polycam)")
+        log(f"   ✓ {n} textura(s) procesadas (relleno + nitidez)")
 
-    # CLAVE: cargar DESDE la carpeta del .obj (rutas relativas del .mtl)
+    # Mapa material→textura leyendo el .mtl (para incrustar manualmente)
+    mat_tex = {}
+    try:
+        for mtl_name in [f for f in os.listdir(obj_dir) if f.lower().endswith(".mtl")]:
+            cur = None
+            with open(os.path.join(obj_dir, mtl_name), "r", errors="ignore") as fh:
+                for line in fh:
+                    line = line.strip()
+                    if line.startswith("newmtl"):
+                        cur = line.split(maxsplit=1)[1].strip()
+                    elif line.lower().startswith("map_kd") and cur:
+                        tex_file = line.split(maxsplit=1)[1].strip()
+                        mat_tex[cur] = os.path.join(obj_dir, os.path.basename(tex_file))
+    except Exception as e:
+        log(f"   (no se pudo leer .mtl para incrustar textura: {e})", "WARN")
+
+    # Cargar DESDE la carpeta del .obj (rutas relativas del .mtl)
     cwd_anterior = os.getcwd()
     try:
         os.chdir(obj_dir)
-        # resolver=True ayuda a que trimesh resuelva texturas referenciadas
         loaded = trimesh.load(obj_name, process=False)
     finally:
         os.chdir(cwd_anterior)
 
-    # trimesh puede devolver un Trimesh o una Scene (varias geometrías)
+    # Normalizar a lista de geometrías
     if isinstance(loaded, trimesh.Scene):
         if len(loaded.geometry) == 0:
             raise RuntimeError("La malla cargada no tiene geometría")
-        export_obj = loaded  # exportar la escena completa (conserva materiales)
-    else:
+        geoms = list(loaded.geometry.values())
         export_obj = loaded
+    else:
+        geoms = [loaded]
+        export_obj = loaded
+
+    # ── FORZAR la textura manualmente sobre cada geometría (anti-blanco) ──
+    # Si una geometría tiene UV pero su material quedó sin imagen, le pegamos
+    # la textura correspondiente (la única, o por orden si hay varias).
+    texturas_disponibles = sorted(set(mat_tex.values())) if mat_tex else [
+        os.path.join(obj_dir, f) for f in sorted(
+            [x for x in os.listdir(obj_dir)
+             if x.lower().endswith((".jpg", ".jpeg", ".png"))])]
+    incrustadas = 0
+    for idx, g in enumerate(geoms):
+        try:
+            visual = getattr(g, "visual", None)
+            uv = getattr(visual, "uv", None)
+            if uv is None:
+                continue  # sin UV no hay forma de mapear textura
+            # Elegir la imagen para esta geometría
+            img_path = None
+            # por nombre de material si lo tenemos
+            mat_name = getattr(getattr(visual, "material", None), "name", None)
+            if mat_name and mat_name in mat_tex and os.path.exists(mat_tex[mat_name]):
+                img_path = mat_tex[mat_name]
+            elif idx < len(texturas_disponibles):
+                img_path = texturas_disponibles[idx]
+            elif texturas_disponibles:
+                img_path = texturas_disponibles[0]
+            if not img_path or not os.path.exists(img_path):
+                continue
+            pil = Image.open(img_path).convert("RGB")
+            # Crear un material PBR nuevo con la textura pegada
+            nuevo = trimesh.visual.material.PBRMaterial(
+                baseColorTexture=pil,
+                metallicFactor=0.0,
+                roughnessFactor=1.0)
+            g.visual = trimesh.visual.TextureVisuals(uv=uv, material=nuevo)
+            incrustadas += 1
+        except Exception as e:
+            log(f"   (no se pudo incrustar textura en geom {idx}: {e})", "WARN")
+    if incrustadas:
+        log(f"   ✓ Textura incrustada manualmente en {incrustadas} geometría(s)")
 
     # Exportar a glb (incrusta geometría + textura en un solo archivo)
     export_obj.export(glb_path, file_type="glb")
@@ -794,9 +851,9 @@ def convert_mesh_to_glb(obj_path, glb_path):
     # Verificar si la textura quedó incrustada (diagnóstico en el log)
     try:
         check = trimesh.load(glb_path)
-        geoms = check.geometry.values() if hasattr(check, "geometry") else [check]
+        geoms_c = check.geometry.values() if hasattr(check, "geometry") else [check]
         tiene_tex = False
-        for g in geoms:
+        for g in geoms_c:
             mat = getattr(getattr(g, "visual", None), "material", None)
             if mat is not None:
                 img = getattr(mat, "image", None) or getattr(mat, "baseColorTexture", None)
