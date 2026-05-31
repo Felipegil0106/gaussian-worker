@@ -429,15 +429,20 @@ def run_openmvs():
         raise RuntimeError("InterfaceCOLMAP no generó scene.mvs")
 
     # ── Paso 6.2: DensifyPointCloud → nube densa (USA CUDA, paso pesado) ──
-    # CALIDAD: resolution-level 1 (mitad de resolución) genera MUCHOS más
-    # puntos que level 2, dando una malla completa en vez de con huecos.
-    # number-views 4 combina varias vistas por punto (más robusto y denso).
+    # CLAVE para calidad: antes tardaba 27s = nube ESCASA con ruido, lo que
+    # producía agujeros negros en la textura. Ahora densificamos MÁS y MEJOR:
+    #   --resolution-level 0  → resolución COMPLETA (no media) = nube densa
+    #   --min-resolution 1024 → más detalle fino
+    #   --number-views 5      → cada punto confirmado por 5 fotos = menos ruido
+    #   --filter-point-cloud 1 → filtra puntos sueltos/ruido tras densificar
+    # Tardará varios minutos (no 27s), pero la nube queda densa y LIMPIA.
     log("OpenMVS 2/5: DensifyPointCloud (nube densa, usa GPU)...")
     run(["DensifyPointCloud",
          "scene.mvs",
-         "--resolution-level", "1",
-         "--min-resolution", "640",
-         "--number-views", "4",
+         "--resolution-level", "0",
+         "--min-resolution", "1024",
+         "--number-views", "5",
+         "--filter-point-cloud", "1",
          "--fusion-mode", "0"],
         TIMEOUTS["mvs_densify"], "mvs_densify", cwd=str(mvs_dir))
     dense = _find_first(mvs_dir, ["scene_dense.mvs", "scene.mvs"])
