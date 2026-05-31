@@ -52,7 +52,7 @@ TIMEOUTS = {
     "gsplat":2700, "collision":600, "upload":600,
     # OpenMVS (malla): DensifyPointCloud es el paso pesado
     "mvs_interface":300, "mvs_densify":2400, "mvs_mesh":1200,
-    "mvs_refine":1800, "mvs_texture":900,
+    "mvs_refine":1800, "mvs_texture":1800,
 }
 ITERS = {"fast":7000, "balanced":30000, "quality":50000}
 
@@ -429,19 +429,18 @@ def run_openmvs():
         raise RuntimeError("InterfaceCOLMAP no generó scene.mvs")
 
     # ── Paso 6.2: DensifyPointCloud → nube densa (USA CUDA, paso pesado) ──
-    # CLAVE para calidad: antes tardaba 27s = nube ESCASA con ruido, lo que
-    # producía agujeros negros en la textura. Ahora densificamos MÁS y MEJOR:
-    #   --resolution-level 0  → resolución COMPLETA (no media) = nube densa
-    #   --min-resolution 1024 → más detalle fino
-    #   --number-views 5      → cada punto confirmado por 5 fotos = menos ruido
-    #   --filter-point-cloud 1 → filtra puntos sueltos/ruido tras densificar
-    # Tardará varios minutos (no 27s), pero la nube queda densa y LIMPIA.
+    # LECCIÓN APRENDIDA: densificar al máximo (level 0) generó DEMASIADA
+    # geometría en zonas sin buena foto → más agujeros negros. Volvemos a un
+    # nivel intermedio que da buena densidad SIN inflar zonas mal vistas.
+    #   --resolution-level 1  → buena densidad, equilibrada
+    #   --number-views 4      → punto confirmado por 4 fotos
+    #   --filter-point-cloud 1 → filtra puntos sueltos/ruido (clave para limpiar)
     log("OpenMVS 2/5: DensifyPointCloud (nube densa, usa GPU)...")
     run(["DensifyPointCloud",
          "scene.mvs",
-         "--resolution-level", "0",
-         "--min-resolution", "1024",
-         "--number-views", "5",
+         "--resolution-level", "1",
+         "--min-resolution", "640",
+         "--number-views", "4",
          "--filter-point-cloud", "1",
          "--fusion-mode", "0"],
         TIMEOUTS["mvs_densify"], "mvs_densify", cwd=str(mvs_dir))
@@ -451,21 +450,18 @@ def run_openmvs():
     log(f"   nube densa: {dense.name}")
 
     # ── Paso 6.3: ReconstructMesh → malla de triángulos ──
-    # CLAVE para evitar la malla negra (comparado con Polycam, que tiene la
-    # malla LIMPIA y la textura 98% aprovechada):
-    #   --close-holes 0       → no inventa relleno (que sale negro)
-    #   --remove-spurious 60  → borra AGRESIVAMENTE trozos basura sin buena foto
-    #   --thickness-factor 1  → no infla la malla
-    #   --decimate 0.5        → simplifica a la mitad de caras (como Polycam,
-    #                           que usa ~500K en vez de millones) → textura
-    #                           mejor aprovechada y archivo más liviano
-    #   --smooth 2            → suaviza
-    log("OpenMVS 3/5: ReconstructMesh (malla limpia tipo Polycam)...")
+    # RECONSTRUCCIÓN (estudiando Polycam: malla LIMPIA, CERRADA, ~500K vért):
+    #   --close-holes 30   → CIERRA agujeros pequeños/medianos. Polycam tiene la
+    #                        malla cerrada; los agujeros abiertos causan que el
+    #                        texturizador deje negro alrededor (auto-oclusión).
+    #   --remove-spurious 40 → borra basura flotante, pero MENOS agresivo (80
+    #                        borraba demasiado y abría huecos).
+    #   --smooth 3         → suaviza picos (menos auto-sombra → menos negro).
+    log("OpenMVS 3/5: ReconstructMesh (malla cerrada tipo Polycam)...")
     run(["ReconstructMesh", dense.name,
-         "--close-holes", "0",
-         "--remove-spurious", "60",
-         "--decimate", "0.5",
-         "--smooth", "2"],
+         "--close-holes", "30",
+         "--remove-spurious", "40",
+         "--smooth", "3"],
         TIMEOUTS["mvs_mesh"], "mvs_mesh", cwd=str(mvs_dir))
     mesh = _find_first(mvs_dir, [
         "scene_dense_mesh.ply", "scene_mesh.ply", "scene_dense.ply"])
@@ -499,20 +495,24 @@ def run_openmvs():
         log("OpenMVS 4/5: RefineMesh OMITIDO (optimización; la malla cruda basta)")
 
     # ── Paso 6.5: TextureMesh → pega las fotos sobre la malla → .obj final ──
-    # --export-type obj genera scene_textured.obj + .mtl + textura .png.
-    # --max-texture-size 4096 → archivo liviano (~15 MB) que carga bien.
-    # CLAVE para que NO salga oscura (Polycam tiene brillo 130, el nuestro 33):
-    #   --global-seam-leveling 1  → iguala el brillo/color entre fotos vecinas
-    #   --local-seam-leveling 1   → suaviza costuras locales
-    #   --patch-packing-heuristic 1 → mejor empaquetado de la textura
-    # Esto imita la corrección de iluminación que hace Polycam.
-    log("OpenMVS 5/5: TextureMesh (pegando fotos + corrección de luz)...")
+    # RECONSTRUCCIÓN (la clave del COLOR, estudiando Polycam):
+    #   Polycam NUNCA deja negro: si una cara no se ve bien, usa color vecino.
+    #   OpenMVS por defecto deja las zonas sin foto en NEGRO (de ahí el problema).
+    # SOLUCIÓN: --empty-color con un GRIS claro (no negro). El valor es un entero
+    #   0xRRGGBB; usamos 0xBEBEBE (gris claro ~190) para que las zonas sin foto
+    #   se vean GRISES neutras, no negras. Así el render NUNCA se ve negro.
+    #   --global-seam-leveling 1 / --local-seam-leveling 1 → igualan brillo/color
+    #     entre fotos (corrección de iluminación, como Polycam).
+    #   --max-texture-size 4096 → archivo liviano que carga bien.
+    empty_gris = str(0xBEBEBE)  # gris claro en decimal = 12500670
+    log("OpenMVS 5/5: TextureMesh (color + relleno gris, NO negro)...")
     run(["TextureMesh", dense.name,
          "-m", refined.name,
          "--export-type", "obj",
          "--max-texture-size", "4096",
          "--global-seam-leveling", "1",
          "--local-seam-leveling", "1",
+         "--empty-color", empty_gris,
          "-o", "scene_textured.obj"],
         TIMEOUTS["mvs_texture"], "mvs_texture", cwd=str(mvs_dir))
 
@@ -534,6 +534,47 @@ def run_openmvs():
 # ══════════════════════════════════════════════════════════════
 # ETAPA 7 (MALLA): convertir .obj texturizado → .glb (para móvil/visores)
 # ══════════════════════════════════════════════════════════════
+
+def rellenar_negro_texturas(obj_dir):
+    """POST-PROCESO (la técnica de Polycam para que NO haya negro):
+    Recorre las texturas .jpg/.png que generó OpenMVS y rellena las zonas
+    NEGRAS (sin foto) con el color de los píxeles vecinos (inpainting).
+    Así, donde OpenMVS dejó negro, queda un color que continúa la imagen,
+    igual que hace Polycam. Devuelve cuántas texturas procesó.
+    """
+    import glob
+    try:
+        import cv2
+        import numpy as np
+    except Exception as e:
+        log(f"   (inpainting no disponible: {e}; sigo sin rellenar)", "WARN")
+        return 0
+
+    texturas = []
+    for ext in ("*.jpg", "*.jpeg", "*.png"):
+        texturas.extend(glob.glob(os.path.join(obj_dir, ext)))
+    procesadas = 0
+    for tex_path in texturas:
+        try:
+            img = cv2.imread(tex_path)
+            if img is None:
+                continue
+            # Máscara de píxeles "negros" (suma de canales muy baja = sin foto)
+            gris = img.sum(axis=2)
+            mask = (gris < 30).astype(np.uint8) * 255
+            negro_pct = (mask > 0).sum() / mask.size * 100
+            if negro_pct < 0.5:
+                continue  # casi no hay negro, no hace falta
+            # Inpainting: rellena el negro con el color de alrededor.
+            # Radio 5 px, método TELEA (rápido y bueno para texturas).
+            reparada = cv2.inpaint(img, mask, 5, cv2.INPAINT_TELEA)
+            cv2.imwrite(tex_path, reparada)
+            procesadas += 1
+            log(f"   inpainting: {os.path.basename(tex_path)} tenía {negro_pct:.0f}% negro → rellenado")
+        except Exception as e:
+            log(f"   (inpainting falló en {os.path.basename(tex_path)}: {e})", "WARN")
+    return procesadas
+
 
 def convert_mesh_to_glb(obj_path, glb_path):
     """Carga el .obj texturizado de OpenMVS (con su .mtl y textura) y lo
@@ -561,6 +602,11 @@ def convert_mesh_to_glb(obj_path, glb_path):
         log(f"   en carpeta: {len(texturas)} textura(s) {texturas[:3]}, {len(mtls)} .mtl")
     except Exception:
         pass
+
+    # POST-PROCESO clave: rellenar las zonas negras de las texturas (anti-negro)
+    n = rellenar_negro_texturas(obj_dir)
+    if n:
+        log(f"   ✓ {n} textura(s) con zonas negras rellenadas (estilo Polycam)")
 
     # CLAVE: cargar DESDE la carpeta del .obj (rutas relativas del .mtl)
     cwd_anterior = os.getcwd()
