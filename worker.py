@@ -530,16 +530,14 @@ def run_openmvs():
     empty_gris = str(0xBEBEBE)  # gris claro en decimal = 12500670
     log("OpenMVS 5/5: TextureMesh (color + relleno gris, NO negro)...")
     # CONTRA EL EFECTO "DESLAVADO"/BORROSO:
-    # Por defecto, TextureMesh mezcla/suaviza mucho entre parches y eso "lava"
-    # el detalle. Bajamos el suavizado para conservar más nitidez por zona,
-    # y subimos la textura a 8192 (como Polycam) para más detalle:
-    #   --cost-smoothness-ratio 0.1 → menos suavizado entre parches (más nítido)
-    #   --max-texture-size 8192 → textura más grande = más detalle
-    # Mantenemos el seam-leveling para que las costuras no se noten.
+    # Bajamos el suavizado de textura para conservar más nitidez por zona.
+    # NOTA: textura en 4096 (NO 8192). Con 8192, LaMa intentaba cargar la
+    # imagen completa en la GPU y pedía ~49 GB → CUDA out of memory → crash.
+    # 4096 es buena resolución y LaMa la aguanta sin quedarse sin memoria.
     run(["TextureMesh", dense.name,
          "-m", refined.name,
          "--export-type", "obj",
-         "--max-texture-size", "8192",
+         "--max-texture-size", "4096",
          "--global-seam-leveling", "1",
          "--local-seam-leveling", "1",
          "--cost-smoothness-ratio", "0.1",
@@ -700,7 +698,26 @@ def aplicar_lama(img_bgr, mask):
         _LAMA_MODEL = SimpleLama()  # descarga el modelo la 1ª vez
     rgb = Image.fromarray(img_bgr[:, :, ::-1])
     m = Image.fromarray(mask).convert("L")
-    out = _LAMA_MODEL(rgb, m)  # devuelve PIL RGB rellenado
+    try:
+        out = _LAMA_MODEL(rgb, m)  # devuelve PIL RGB rellenado
+    except RuntimeError as e:
+        # Si la GPU se queda sin memoria (textura grande / GPU chica),
+        # reintentar en CPU: más lento pero NO tumba el render.
+        if "out of memory" in str(e).lower() or "cuda" in str(e).lower():
+            log("   LaMa: sin memoria GPU; reintentando en CPU (más lento)...", "WARN")
+            try:
+                import torch
+                torch.cuda.empty_cache()
+            except Exception:
+                pass
+            try:
+                _LAMA_MODEL.model = _LAMA_MODEL.model.cpu()
+                _LAMA_MODEL.device = "cpu"
+            except Exception:
+                pass
+            out = _LAMA_MODEL(rgb, m)
+        else:
+            raise
     out_np = np.array(out)
     return out_np[:, :, ::-1]  # de vuelta a BGR
 
