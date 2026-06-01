@@ -460,9 +460,18 @@ def run_openmvs():
     #   SIN --decimate: simplificar creaba caras grandes planas = MÁS facetas
     #                   visibles. Dejamos la malla densa para superficie suave.
     log("OpenMVS 3/5: ReconstructMesh (malla suave, anti-facetas)...")
+    # CONTRA EL MOSAICO/HEXÁGONOS (descubrimiento clave):
+    # La malla salía con ~2.5 MILLONES de vértices (Polycam usa ~510K). Tantos
+    # vértices = la textura se parte en miles de parches DIMINUTOS que se ven
+    # como mosaico/hexágonos/triángulos. La solución es SIMPLIFICAR la malla:
+    #   --decimate 0.2 → conserva ~20% de las caras → baja de 2.5M a ~500K
+    #                    vértices (como Polycam) → parches GRANDES → textura
+    #                    continua y nítida (no mosaico).
+    #   --close-holes 100 / --remove-spurious 30 / --smooth 5 → como antes.
     run(["ReconstructMesh", dense.name,
          "--close-holes", "100",
          "--remove-spurious", "30",
+         "--decimate", "0.2",
          "--smooth", "5"],
         TIMEOUTS["mvs_mesh"], "mvs_mesh", cwd=str(mvs_dir))
     mesh = _find_first(mvs_dir, [
