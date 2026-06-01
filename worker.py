@@ -639,9 +639,12 @@ def _instalar_dependencias_ia():
                        check=True, timeout=600)
     except Exception as e:
         log(f"   IA: aviso instalando basicsr/realesrgan --no-deps ({e})", "WARN")
-    # dependencias livianas que basicsr/realesrgan necesitan (sin torch)
-    for dep in ("addict", "future", "lmdb", "pyyaml", "yapf", "tb-nightly",
-                "gfpgan", "facexlib"):
+    # dependencias livianas que basicsr/realesrgan necesitan (SIN torch).
+    # Las instalamos TODAS de una vez para evitar el goteo de errores
+    # (scipy, tqdm, etc. van apareciendo uno por uno si faltan).
+    for dep in ("addict", "future", "lmdb", "pyyaml", "yapf", "scipy",
+                "tqdm", "requests", "tensorboard", "einops", "opencv-python",
+                "tb-nightly", "gfpgan", "facexlib"):
         try:
             subprocess.run([sys.executable, "-m", "pip", "install", "--quiet",
                             "--no-deps", dep], check=False, timeout=300)
