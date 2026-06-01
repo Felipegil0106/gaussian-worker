@@ -830,16 +830,21 @@ def convert_mesh_to_glb(obj_path, glb_path):
                 img_path = texturas_disponibles[0]
             if not img_path or not os.path.exists(img_path):
                 continue
-            # FIX del error "'JpegImageFile' object has no attribute '_im'":
-            # PIL abre la imagen de forma "perezosa" (sin decodificar píxeles),
-            # y trimesh falla al exportarla en Pillow 10+. La forma ROBUSTA
-            # (funciona en cualquier versión de Pillow) es recrear la imagen
-            # desde una COPIA escribible del array (np.array, no np.asarray),
-            # con modo y tipo explícitos, y forzar la carga.
-            import numpy as _np
-            _arr = _np.array(Image.open(img_path).convert("RGB"))  # copia escribible
-            pil = Image.fromarray(_arr.astype(_np.uint8), "RGB")
-            pil.load()  # materializa los píxeles (evita el error '_im')
+            # FIX DEFINITIVO del error "'JpegImageFile'/'PngImageFile' object
+            # has no attribute '_im'" (bug de trimesh 4.x + Pillow nuevo al
+            # EXPORTAR, en la llamada interna img.save()). La solución robusta:
+            # recodificar la textura a PNG EN MEMORIA y reabrirla; eso entrega
+            # un objeto PIL 100% materializado y con .format poblado, que
+            # trimesh exporta sin tropezar.
+            import numpy as _np, io as _io
+            _base = Image.open(img_path).convert("RGB")
+            _buf = _io.BytesIO()
+            _base.save(_buf, format="PNG")
+            _buf.seek(0)
+            pil = Image.open(_buf)
+            pil.load()  # materializa los píxeles (clave para evitar '_im')
+            if not getattr(pil, "format", None):
+                pil.format = "PNG"
             # Crear un material PBR nuevo con la textura pegada
             nuevo = trimesh.visual.material.PBRMaterial(
                 baseColorTexture=pil,
@@ -852,8 +857,40 @@ def convert_mesh_to_glb(obj_path, glb_path):
     if incrustadas:
         log(f"   ✓ Textura incrustada manualmente en {incrustadas} geometría(s)")
 
-    # Exportar a glb (incrusta geometría + textura en un solo archivo)
-    export_obj.export(glb_path, file_type="glb")
+    # Exportar a glb (incrusta geometría + textura en un solo archivo).
+    # RED DE SEGURIDAD: si trimesh choca con el bug '_im' de Pillow al
+    # exportar, recodificamos TODAS las imágenes de la escena a PNG limpio
+    # (en memoria) y reintentamos. Esto cubre el caso de imágenes que trimesh
+    # cargó del .mtl por su cuenta (no por nuestro incrustado manual).
+    def _sanear_imagenes_de_escena(obj_para_exportar):
+        import io as _io2
+        geos = (obj_para_exportar.geometry.values()
+                if hasattr(obj_para_exportar, "geometry") else [obj_para_exportar])
+        for _g in geos:
+            try:
+                _mat = getattr(getattr(_g, "visual", None), "material", None)
+                if _mat is None:
+                    continue
+                _img = getattr(_mat, "baseColorTexture", None)
+                if _img is None:
+                    continue
+                _b = _io2.BytesIO()
+                _img.convert("RGB").save(_b, format="PNG")
+                _b.seek(0)
+                _limpia = Image.open(_b)
+                _limpia.load()
+                if not getattr(_limpia, "format", None):
+                    _limpia.format = "PNG"
+                _mat.baseColorTexture = _limpia
+            except Exception:
+                pass
+
+    try:
+        export_obj.export(glb_path, file_type="glb")
+    except Exception as e:
+        log(f"   export falló ({e}); saneando imágenes y reintentando...", "WARN")
+        _sanear_imagenes_de_escena(export_obj)
+        export_obj.export(glb_path, file_type="glb")
     mb = os.path.getsize(glb_path) / (1024 * 1024)
     log(f"GLB generado: {mb:.1f} MB")
 
