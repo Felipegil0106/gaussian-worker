@@ -468,11 +468,16 @@ def run_openmvs():
     #                    vértices (como Polycam) → parches GRANDES → textura
     #                    continua y nítida (no mosaico).
     #   --close-holes 100 / --remove-spurious 30 / --smooth 5 → como antes.
+    # CONTRA EL MOSAICO/HEXÁGONOS pero SIN lavar el detalle:
+    # decimate 0.2 (conservar 20%) quitaba el mosaico pero dejaba la textura
+    # "deslavada"/borrosa (quitaba demasiada geometría). decimate 0.5
+    # (conservar 50%) es el PUNTO MEDIO: reduce el mosaico y conserva detalle.
+    #   --decimate 0.5 → de ~2.5M a ~1.2M vértices (entre el exceso y el lavado)
     run(["ReconstructMesh", dense.name,
          "--close-holes", "100",
          "--remove-spurious", "30",
-         "--decimate", "0.2",
-         "--smooth", "5"],
+         "--decimate", "0.5",
+         "--smooth", "3"],
         TIMEOUTS["mvs_mesh"], "mvs_mesh", cwd=str(mvs_dir))
     mesh = _find_first(mvs_dir, [
         "scene_dense_mesh.ply", "scene_mesh.ply", "scene_dense.ply"])
@@ -524,12 +529,20 @@ def run_openmvs():
     #   --max-texture-size 4096 → archivo liviano que carga bien.
     empty_gris = str(0xBEBEBE)  # gris claro en decimal = 12500670
     log("OpenMVS 5/5: TextureMesh (color + relleno gris, NO negro)...")
+    # CONTRA EL EFECTO "DESLAVADO"/BORROSO:
+    # Por defecto, TextureMesh mezcla/suaviza mucho entre parches y eso "lava"
+    # el detalle. Bajamos el suavizado para conservar más nitidez por zona,
+    # y subimos la textura a 8192 (como Polycam) para más detalle:
+    #   --cost-smoothness-ratio 0.1 → menos suavizado entre parches (más nítido)
+    #   --max-texture-size 8192 → textura más grande = más detalle
+    # Mantenemos el seam-leveling para que las costuras no se noten.
     run(["TextureMesh", dense.name,
          "-m", refined.name,
          "--export-type", "obj",
-         "--max-texture-size", "4096",
+         "--max-texture-size", "8192",
          "--global-seam-leveling", "1",
          "--local-seam-leveling", "1",
+         "--cost-smoothness-ratio", "0.1",
          "--empty-color", empty_gris,
          "-o", "scene_textured.obj"],
         TIMEOUTS["mvs_texture"], "mvs_texture", cwd=str(mvs_dir))
