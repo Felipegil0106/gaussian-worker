@@ -607,14 +607,22 @@ def _instalar_dependencias_ia():
         if not tiene_torch:
             raise RuntimeError(f"No se pudo instalar torch para la IA: {ultimo_error}")
 
-    # LaMa (relleno natural)
+    # LaMa (relleno natural). Instalar SIN dependencias: simple-lama exige
+    # pillow<10 y pip intentaba COMPILAR un Pillow viejo desde cero, lo que
+    # FALLA en el pod (exit 1). Con --no-deps usa el torch/pillow/numpy que el
+    # pod YA tiene, que es lo único que LaMa necesita.
     try:
         import simple_lama_inpainting  # noqa
     except Exception:
-        log("   IA: instalando simple-lama-inpainting...")
+        log("   IA: instalando simple-lama-inpainting (sin tocar dependencias)...")
         try:
             subprocess.run([sys.executable, "-m", "pip", "install", "--quiet",
-                            "simple-lama-inpainting"], check=True, timeout=600)
+                            "--no-deps", "simple-lama-inpainting"],
+                           check=True, timeout=600)
+            # 'fire' es la única dependencia liviana que LaMa usa y que --no-deps
+            # no trae; el resto (torch, cv2, numpy, PIL) ya está en el pod.
+            subprocess.run([sys.executable, "-m", "pip", "install", "--quiet",
+                            "fire"], check=False, timeout=300)
             import simple_lama_inpainting  # noqa
         except Exception as e:
             raise RuntimeError(f"No se pudo instalar/importar LaMa: {e}")
