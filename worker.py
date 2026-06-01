@@ -581,6 +581,27 @@ _LAMA_MODEL = None
 _ESRGAN_MODEL = None
 
 
+def _pip_install(args, intentos=3, timeout=600, obligatorio=True):
+    """Instala con pip REINTENTANDO si falla. Los fallos de instalación de las
+    IAs suelen ser TEMPORALES (corte de red o PyPI saturado), no del comando.
+    Reintentar 3 veces hace el arranque resistente a esos cortes.
+    Si obligatorio=False, no lanza excepción aunque falle (deps opcionales)."""
+    ultimo = None
+    for n in range(1, intentos + 1):
+        try:
+            subprocess.run([sys.executable, "-m", "pip", "install", "--quiet"]
+                           + args, check=True, timeout=timeout)
+            return True
+        except Exception as e:
+            ultimo = e
+            if n < intentos:
+                log(f"   IA: intento {n}/{intentos} falló; reintentando en 5s...", "WARN")
+                time.sleep(5)
+    if obligatorio:
+        raise RuntimeError(f"pip install {' '.join(args)} falló tras {intentos} intentos: {ultimo}")
+    return False
+
+
 def _parche_basicsr_torchvision():
     """basicsr (que usa Real-ESRGAN) importa 'torchvision.transforms.
     functional_tensor', un módulo que las versiones nuevas de torchvision YA
@@ -618,60 +639,45 @@ def _instalar_dependencias_ia():
              "https://download.pytorch.org/whl/cu121"],
             ["torch", "torchvision"],
         ):
-            try:
-                subprocess.run([sys.executable, "-m", "pip", "install",
-                                "--quiet"] + args, check=True, timeout=1200)
+            if _pip_install(args, intentos=2, timeout=1200, obligatorio=False):
                 tiene_torch = True
                 break
-            except Exception as e:
-                ultimo_error = e
-                log(f"   IA: intento de instalar torch falló ({e})", "WARN")
+            else:
+                ultimo_error = "instalación falló tras reintentos"
+                log(f"   IA: intento de instalar torch falló ({args[0]})", "WARN")
         if not tiene_torch:
             raise RuntimeError(f"No se pudo instalar torch para la IA: {ultimo_error}")
 
     # LaMa (relleno natural). Instalar SIN dependencias: simple-lama exige
     # pillow<10 y pip intentaba COMPILAR un Pillow viejo desde cero, lo que
     # FALLA en el pod (exit 1). Con --no-deps usa el torch/pillow/numpy que el
-    # pod YA tiene, que es lo único que LaMa necesita.
+    # pod YA tiene. Con reintentos por si la descarga falla por red.
     try:
         import simple_lama_inpainting  # noqa
     except Exception:
         log("   IA: instalando simple-lama-inpainting (sin tocar dependencias)...")
+        _pip_install(["--no-deps", "simple-lama-inpainting"], obligatorio=True)
+        # 'fire' es la única dependencia liviana que LaMa usa y que --no-deps
+        # no trae; el resto (torch, cv2, numpy, PIL) ya está en el pod.
+        _pip_install(["fire"], obligatorio=False)
         try:
-            subprocess.run([sys.executable, "-m", "pip", "install", "--quiet",
-                            "--no-deps", "simple-lama-inpainting"],
-                           check=True, timeout=600)
-            # 'fire' es la única dependencia liviana que LaMa usa y que --no-deps
-            # no trae; el resto (torch, cv2, numpy, PIL) ya está en el pod.
-            subprocess.run([sys.executable, "-m", "pip", "install", "--quiet",
-                            "fire"], check=False, timeout=300)
             import simple_lama_inpainting  # noqa
         except Exception as e:
-            raise RuntimeError(f"No se pudo instalar/importar LaMa: {e}")
+            raise RuntimeError(f"No se pudo importar LaMa tras instalar: {e}")
 
     # Real-ESRGAN (nitidez). Instalar SIN tocar torch (--no-deps) y traer sus
     # dependencias reales aparte. basicsr da un import roto con torchvision
     # nuevo, así que aplicamos el parche ANTES de importarlo.
     log("   IA: preparando Real-ESRGAN (con parche de torchvision)...")
-    try:
-        # basicsr y realesrgan sin arrastrar torch (evita el conflicto que
-        # hacía fallar el pip con exit 1)
-        subprocess.run([sys.executable, "-m", "pip", "install", "--quiet",
-                        "--no-deps", "basicsr", "realesrgan"],
-                       check=True, timeout=600)
-    except Exception as e:
-        log(f"   IA: aviso instalando basicsr/realesrgan --no-deps ({e})", "WARN")
+    # basicsr y realesrgan sin arrastrar torch (con reintentos por red)
+    _pip_install(["--no-deps", "basicsr", "realesrgan"], obligatorio=False)
     # dependencias livianas que basicsr/realesrgan necesitan (SIN torch).
     # Las instalamos TODAS de una vez para evitar el goteo de errores
     # (scipy, tqdm, etc. van apareciendo uno por uno si faltan).
     for dep in ("addict", "future", "lmdb", "pyyaml", "yapf", "scipy",
                 "tqdm", "requests", "tensorboard", "einops", "opencv-python",
                 "tb-nightly", "gfpgan", "facexlib"):
-        try:
-            subprocess.run([sys.executable, "-m", "pip", "install", "--quiet",
-                            "--no-deps", dep], check=False, timeout=300)
-        except Exception:
-            pass
+        _pip_install(["--no-deps", dep], intentos=2, timeout=300, obligatorio=False)
     # Aplicar el parche y verificar que ahora sí importa
     _parche_basicsr_torchvision()
     try:
