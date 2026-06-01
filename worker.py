@@ -746,6 +746,51 @@ def aplicar_esrgan(img_bgr):
 # ETAPA 7 (MALLA): convertir .obj texturizado → .glb (para móvil/visores)
 # ══════════════════════════════════════════════════════════════
 
+def limpiar_puntos_colores(img_bgr):
+    """Quita los 'puntos de colores' (verde/rojo/magenta neón) que COLMAP
+    genera como ruido y OpenMVS pinta en la textura. CLAVE: NO toca zonas
+    grandes de color real (como una cobija azul) — solo borra:
+      (a) colores NEÓN imposibles en una habitación (verde/magenta/rojo puro), y
+      (b) manchas ultra-saturadas PEQUEÑAS y aisladas.
+    Lo borrado se rellena con el color de alrededor (inpaint)."""
+    import numpy as np
+    try:
+        hsv = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2HSV)
+        H, S, V = hsv[:, :, 0], hsv[:, :, 1], hsv[:, :, 2]
+        # (a) colores neón que no existen en interiores reales (el AZUL NO se toca)
+        verde   = (H >= 35) & (H <= 85) & (S > 120) & (V > 90)
+        magenta = (H >= 140) & (H <= 170) & (S > 120) & (V > 90)
+        rojo    = ((H <= 10) | (H >= 172)) & (S > 160) & (V > 110)
+        neon = (verde | magenta | rojo).astype(np.uint8) * 255
+        # (b) manchas ultra-saturadas pequeñas y aisladas (puntos sueltos)
+        cand = ((S > 175) & (V > 120)).astype(np.uint8)
+        n, labels, stats, _ = cv2.connectedComponentsWithStats(cand, connectivity=8)
+        chicas = np.zeros_like(cand)
+        for k in range(1, n):
+            if stats[k, cv2.CC_STAT_AREA] < 1500:  # chico = punto; grande = objeto real
+                chicas[labels == k] = 255
+        mask = cv2.bitwise_or(neon, chicas)
+        mask = cv2.dilate(mask, np.ones((5, 5), np.uint8), iterations=1)
+        if mask.sum() == 0:
+            return img_bgr
+        return cv2.inpaint(img_bgr, mask, 5, cv2.INPAINT_TELEA)
+    except Exception:
+        return img_bgr  # si algo falla, devolver la imagen sin tocar
+
+
+def realce_suave(img_bgr):
+    """Realce de contraste local SUAVE (CLAHE) para que las zonas 'deslavadas'
+    recuperen algo de definición, sin exagerar ni saturar colores."""
+    try:
+        lab = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2LAB)
+        l, a, b = cv2.split(lab)
+        clahe = cv2.createCLAHE(clipLimit=1.5, tileGridSize=(8, 8))
+        l = clahe.apply(l)
+        return cv2.cvtColor(cv2.merge([l, a, b]), cv2.COLOR_LAB2BGR)
+    except Exception:
+        return img_bgr
+
+
 def rellenar_negro_texturas(obj_dir):
     """POST-PROCESO (imita a Polycam para que NO haya negro ni facetas):
     En las zonas NEGRAS (sin foto) de cada textura:
@@ -790,6 +835,11 @@ def rellenar_negro_texturas(obj_dir):
         resultado = img
 
         if USAR_IA:
+            # ── PASO A0: limpiar puntos de colores (ruido de COLMAP) ──
+            # Quita los puntos verde/rojo/magenta neón ANTES de las IAs, para
+            # que LaMa/ESRGAN no los "amplifiquen". No toca el color real.
+            img = limpiar_puntos_colores(img)
+            resultado = img
             # ── PASO A: relleno natural con LaMa (si hay zonas sin foto) ──
             if negro_pct >= 0.5:
                 mask_d = cv2.dilate(mask, np.ones((5, 5), np.uint8))
@@ -800,6 +850,8 @@ def rellenar_negro_texturas(obj_dir):
             mejor = aplicar_esrgan(resultado)  # si falla → para todo
             resultado = mejor
             log(f"   Real-ESRGAN: {os.path.basename(tex_path)} → más nítida (IA)")
+            # ── PASO C: realce suave de contraste (contra el 'deslavado') ──
+            resultado = realce_suave(resultado)
 
             # ── NORMALIZAR antes de guardar (clave para que NO salga blanco) ──
             # 1) asegurar uint8 0-255 (ESRGAN puede devolver float o >255)
