@@ -436,12 +436,19 @@ def run_openmvs():
     #   --number-views 4      → punto confirmado por 4 fotos
     #   --filter-point-cloud 1 → filtra puntos sueltos/ruido (clave para limpiar)
     log("OpenMVS 2/5: DensifyPointCloud (nube densa, usa GPU)...")
+    # CAMBIO (anti-manchas-grises): conservar las fotos que SÍ se tomaron.
+    #   --number-views 2 (antes 4): una zona vista por 2 fotos YA es válida.
+    #     Exigir 4 borraba zonas reales que solo se ven bien en 2-3 fotos →
+    #     huecos → gris. En un cuarto escaneado en movimiento, muchas
+    #     superficies legítimas solo aparecen nítidas en 2-3 fotos.
+    #   --filter-point-cloud 0 (antes 1): NO borrar puntos buenos. El filtro
+    #     agresivo quitaba puntos válidos junto con el ruido.
     run(["DensifyPointCloud",
          "scene.mvs",
          "--resolution-level", "1",
          "--min-resolution", "640",
-         "--number-views", "4",
-         "--filter-point-cloud", "1",
+         "--number-views", "2",
+         "--filter-point-cloud", "0",
          "--fusion-mode", "0"],
         TIMEOUTS["mvs_densify"], "mvs_densify", cwd=str(mvs_dir))
     dense = _find_first(mvs_dir, ["scene_dense.mvs", "scene.mvs"])
@@ -473,11 +480,16 @@ def run_openmvs():
     # "deslavada"/borrosa (quitaba demasiada geometría). decimate 0.5
     # (conservar 50%) es el PUNTO MEDIO: reduce el mosaico y conserva detalle.
     #   --decimate 0.5 → de ~2.5M a ~1.2M vértices (entre el exceso y el lavado)
+    # CAMBIO (anti-manchas + más detalle): recorte y suavizado MÁS suaves.
+    #   --decimate 0.7 (antes 0.5): conservar 70% de las caras (antes 50%).
+    #     Más geometría = más detalle, SIN llegar a los 2.5M vértices que
+    #     causaban el mosaico de hexágonos. Es el equilibrio fino.
+    #   --smooth 2 (antes 3): menos suavizado = menos "deslavado".
     run(["ReconstructMesh", dense.name,
          "--close-holes", "100",
          "--remove-spurious", "30",
-         "--decimate", "0.5",
-         "--smooth", "3"],
+         "--decimate", "0.7",
+         "--smooth", "2"],
         TIMEOUTS["mvs_mesh"], "mvs_mesh", cwd=str(mvs_dir))
     mesh = _find_first(mvs_dir, [
         "scene_dense_mesh.ply", "scene_mesh.ply", "scene_dense.ply"])
@@ -534,6 +546,15 @@ def run_openmvs():
     # NOTA: textura en 4096 (NO 8192). Con 8192, LaMa intentaba cargar la
     # imagen completa en la GPU y pedía ~49 GB → CUDA out of memory → crash.
     # 4096 es buena resolución y LaMa la aguanta sin quedarse sin memoria.
+    #
+    # CAMBIO CLAVE (anti-manchas-grises, el más importante):
+    #   --outlier-threshold 0 (antes usaba el por defecto 0.06): DESACTIVA el
+    #   descarte de caras "atípicas". Por defecto, OpenMVS deja SIN textura
+    #   (gris) cualquier cara cuyo color no concuerde bien entre las fotos.
+    #   En un cuarto con iluminación que varía entre tomas, eso rechaza zonas
+    #   reales (sobre todo la VENTANA, que refleja distinto en cada foto) y las
+    #   pinta de gris. Con 0, OpenMVS texturiza todas las caras que tienen al
+    #   menos una foto, en vez de descartarlas por diferencia de color.
     run(["TextureMesh", dense.name,
          "-m", refined.name,
          "--export-type", "obj",
@@ -541,6 +562,7 @@ def run_openmvs():
          "--global-seam-leveling", "1",
          "--local-seam-leveling", "1",
          "--cost-smoothness-ratio", "0.1",
+         "--outlier-threshold", "0",
          "--empty-color", empty_gris,
          "-o", "scene_textured.obj"],
         TIMEOUTS["mvs_texture"], "mvs_texture", cwd=str(mvs_dir))
