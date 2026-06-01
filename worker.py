@@ -832,12 +832,14 @@ def convert_mesh_to_glb(obj_path, glb_path):
                 continue
             # FIX del error "'JpegImageFile' object has no attribute '_im'":
             # PIL abre la imagen de forma "perezosa" (sin decodificar píxeles),
-            # y trimesh falla al exportarla. Recrear la imagen desde un array
-            # numpy fuerza la decodificación y entrega una imagen "limpia".
+            # y trimesh falla al exportarla en Pillow 10+. La forma ROBUSTA
+            # (funciona en cualquier versión de Pillow) es recrear la imagen
+            # desde una COPIA escribible del array (np.array, no np.asarray),
+            # con modo y tipo explícitos, y forzar la carga.
             import numpy as _np
-            _tmp = Image.open(img_path).convert("RGB")
-            pil = Image.fromarray(_np.asarray(_tmp))
-            pil.load()  # garantiza que los píxeles están en memoria
+            _arr = _np.array(Image.open(img_path).convert("RGB"))  # copia escribible
+            pil = Image.fromarray(_arr.astype(_np.uint8), "RGB")
+            pil.load()  # materializa los píxeles (evita el error '_im')
             # Crear un material PBR nuevo con la textura pegada
             nuevo = trimesh.visual.material.PBRMaterial(
                 baseColorTexture=pil,
