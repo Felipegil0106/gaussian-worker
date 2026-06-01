@@ -559,6 +559,25 @@ _LAMA_MODEL = None
 _ESRGAN_MODEL = None
 
 
+def _parche_basicsr_torchvision():
+    """basicsr (que usa Real-ESRGAN) importa 'torchvision.transforms.
+    functional_tensor', un módulo que las versiones nuevas de torchvision YA
+    eliminaron → ModuleNotFoundError → realesrgan no se puede usar.
+    Este parche crea ese módulo apuntando al nuevo 'functional', ANTES de
+    importar basicsr/realesrgan. Es la solución estándar de la comunidad."""
+    import sys as _sys, types as _types
+    if "torchvision.transforms.functional_tensor" in _sys.modules:
+        return
+    try:
+        import torchvision.transforms.functional as _F
+        _mod = _types.ModuleType("torchvision.transforms.functional_tensor")
+        # basicsr usa rgb_to_grayscale; redirigir al nuevo módulo
+        _mod.rgb_to_grayscale = _F.rgb_to_grayscale
+        _sys.modules["torchvision.transforms.functional_tensor"] = _mod
+    except Exception:
+        pass
+
+
 def _instalar_dependencias_ia():
     """Instala (si faltan) las librerías de IA. Se llama una sola vez.
     Si algo NO se puede instalar, LANZA una excepción (el worker parará y
@@ -587,20 +606,46 @@ def _instalar_dependencias_ia():
                 log(f"   IA: intento de instalar torch falló ({e})", "WARN")
         if not tiene_torch:
             raise RuntimeError(f"No se pudo instalar torch para la IA: {ultimo_error}")
-    # simple-lama-inpainting (LaMa) y realesrgan + basicsr
-    for paquete, imp in [("simple-lama-inpainting", "simple_lama_inpainting"),
-                         ("realesrgan", "realesrgan"),
-                         ("basicsr", "basicsr")]:
+
+    # LaMa (relleno natural)
+    try:
+        import simple_lama_inpainting  # noqa
+    except Exception:
+        log("   IA: instalando simple-lama-inpainting...")
         try:
-            __import__(imp)
+            subprocess.run([sys.executable, "-m", "pip", "install", "--quiet",
+                            "simple-lama-inpainting"], check=True, timeout=600)
+            import simple_lama_inpainting  # noqa
+        except Exception as e:
+            raise RuntimeError(f"No se pudo instalar/importar LaMa: {e}")
+
+    # Real-ESRGAN (nitidez). Instalar SIN tocar torch (--no-deps) y traer sus
+    # dependencias reales aparte. basicsr da un import roto con torchvision
+    # nuevo, así que aplicamos el parche ANTES de importarlo.
+    log("   IA: preparando Real-ESRGAN (con parche de torchvision)...")
+    try:
+        # basicsr y realesrgan sin arrastrar torch (evita el conflicto que
+        # hacía fallar el pip con exit 1)
+        subprocess.run([sys.executable, "-m", "pip", "install", "--quiet",
+                        "--no-deps", "basicsr", "realesrgan"],
+                       check=True, timeout=600)
+    except Exception as e:
+        log(f"   IA: aviso instalando basicsr/realesrgan --no-deps ({e})", "WARN")
+    # dependencias livianas que basicsr/realesrgan necesitan (sin torch)
+    for dep in ("addict", "future", "lmdb", "pyyaml", "yapf", "tb-nightly",
+                "gfpgan", "facexlib"):
+        try:
+            subprocess.run([sys.executable, "-m", "pip", "install", "--quiet",
+                            "--no-deps", dep], check=False, timeout=300)
         except Exception:
-            log(f"   IA: instalando {paquete}...")
-            try:
-                subprocess.run([sys.executable, "-m", "pip", "install",
-                                "--quiet", paquete], check=True, timeout=600)
-                __import__(imp)  # verificar que ahora sí importa
-            except Exception as e:
-                raise RuntimeError(f"No se pudo instalar/importar {paquete} para la IA: {e}")
+            pass
+    # Aplicar el parche y verificar que ahora sí importa
+    _parche_basicsr_torchvision()
+    try:
+        from realesrgan import RealESRGANer  # noqa
+        from basicsr.archs.rrdbnet_arch import RRDBNet  # noqa
+    except Exception as e:
+        raise RuntimeError(f"No se pudo importar Real-ESRGAN tras el parche: {e}")
     return True
 
 
@@ -627,6 +672,7 @@ def aplicar_esrgan(img_bgr):
     Si falla, LANZA una excepción (el worker parará y mandará el log)."""
     global _ESRGAN_MODEL
     if _ESRGAN_MODEL is None:
+        _parche_basicsr_torchvision()  # asegurar el parche antes de importar
         from realesrgan import RealESRGANer
         from basicsr.archs.rrdbnet_arch import RRDBNet
         modelo = RRDBNet(num_in_ch=3, num_out_ch=3, num_feat=64,
