@@ -492,6 +492,53 @@ def run_openmvs():
     except Exception:
         pass
 
+    # ── Paso 6.3b: SUPERFICIE POISSON (open3d) — anti-triángulos de RAÍZ ──
+    # CAMBIO DE FONDO: la malla de OpenMVS, por su naturaleza, queda irregular
+    # y "facetada" (se ven triángulos/hexágonos al acercar). Poisson toma los
+    # puntos de esa malla y reconstruye una SUPERFICIE CERRADA Y CONTINUA:
+    # rellena huecos (paredes que faltaban), redondea formas (una almohada se
+    # ve redonda), y elimina las facetas sueltas. Es gratis y libre comercial.
+    # Si Poisson fallara, seguimos con la malla de OpenMVS (no rompe el job).
+    USAR_POISSON = True
+    if USAR_POISSON:
+        try:
+            log("OpenMVS 3b/5: Reconstrucción de superficie Poisson (anti-facetas)...")
+            import open3d as o3d
+            import numpy as _npp
+            _src = o3d.io.read_triangle_mesh(str(mesh))
+            _src.compute_vertex_normals()
+            _pcd = o3d.geometry.PointCloud()
+            _pcd.points = _src.vertices
+            if _src.has_vertex_normals():
+                _pcd.normals = _src.vertex_normals
+            else:
+                _pcd.estimate_normals(
+                    search_param=o3d.geometry.KDTreeSearchParamHybrid(radius=0.1, max_nn=30))
+            _pcd.orient_normals_consistent_tangent_plane(20)
+            # depth 9 = buen equilibrio detalle/suavidad (subir a 10 = más detalle)
+            _pm, _dens = o3d.geometry.TriangleMesh.create_from_point_cloud_poisson(
+                _pcd, depth=9, scale=1.1, linear_fit=False)
+            # Recortar las zonas "infladas" de baja densidad (artefactos Poisson)
+            _dens = _npp.asarray(_dens)
+            _pm.remove_vertices_by_mask(_dens < _npp.quantile(_dens, 0.05))
+            # Si quedó muy densa, simplificar a ~600K caras (como Polycam) para
+            # que TextureMesh sea rápido y la textura no se parta en mil parches.
+            if len(_pm.triangles) > 600000:
+                _pm = _pm.simplify_quadric_decimation(600000)
+            # Suavizado final ligero (superficie tersa)
+            _pm = _pm.filter_smooth_simple(number_of_iterations=2)
+            _pm.compute_vertex_normals()
+            _poisson_path = mvs_dir / "scene_poisson.ply"
+            o3d.io.write_triangle_mesh(str(_poisson_path), _pm)
+            if _poisson_path.exists() and len(_pm.vertices) > 1000:
+                mesh = _poisson_path
+                log(f"   ✓ Superficie Poisson: {len(_pm.vertices):,} vértices, "
+                    f"{len(_pm.triangles):,} caras (continua, sin facetas)")
+            else:
+                log("   (Poisson no produjo malla válida; sigo con la de OpenMVS)", "WARN")
+        except Exception as e:
+            log(f"   (Poisson falló: {e}; sigo con la malla de OpenMVS)", "WARN")
+
     # ── Paso 6.4: RefineMesh → suaviza/mejora ──
     # OPTIMIZACIÓN: desactivado por defecto. En pruebas tardaba ~4.5 min y NO
     # dejaba archivo útil (la malla cruda ya es buena para nuestro caso).
@@ -625,6 +672,20 @@ def _instalar_dependencias_ia():
     mandará el log, según lo pedido: atacar el problema apenas surja).
     No forzamos versión de torch si la imagen ya lo trae (para no romper CUDA)."""
     global _LAMA_MODEL, _ESRGAN_MODEL
+
+    # open3d: necesario para la reconstrucción de superficie Poisson (anti-facetas).
+    # Lo instalamos primero porque el pipeline de malla ahora depende de él.
+    try:
+        import open3d  # noqa
+    except Exception:
+        log("   Instalando open3d (para superficie Poisson anti-triángulos)...")
+        _pip_install(["open3d"], intentos=3, timeout=900, obligatorio=False)
+        try:
+            import open3d  # noqa
+            log("   ✓ open3d listo")
+        except Exception:
+            log("   (open3d no se pudo instalar; Poisson se omitirá, sigo con OpenMVS)", "WARN")
+
     tiene_torch = False
     try:
         import torch  # noqa
