@@ -436,19 +436,12 @@ def run_openmvs():
     #   --number-views 4      → punto confirmado por 4 fotos
     #   --filter-point-cloud 1 → filtra puntos sueltos/ruido (clave para limpiar)
     log("OpenMVS 2/5: DensifyPointCloud (nube densa, usa GPU)...")
-    # CAMBIO (anti-manchas-grises): conservar las fotos que SÍ se tomaron.
-    #   --number-views 2 (antes 4): una zona vista por 2 fotos YA es válida.
-    #     Exigir 4 borraba zonas reales que solo se ven bien en 2-3 fotos →
-    #     huecos → gris. En un cuarto escaneado en movimiento, muchas
-    #     superficies legítimas solo aparecen nítidas en 2-3 fotos.
-    #   --filter-point-cloud 0 (antes 1): NO borrar puntos buenos. El filtro
-    #     agresivo quitaba puntos válidos junto con el ruido.
     run(["DensifyPointCloud",
          "scene.mvs",
          "--resolution-level", "1",
          "--min-resolution", "640",
-         "--number-views", "2",
-         "--filter-point-cloud", "0",
+         "--number-views", "4",
+         "--filter-point-cloud", "1",
          "--fusion-mode", "0"],
         TIMEOUTS["mvs_densify"], "mvs_densify", cwd=str(mvs_dir))
     dense = _find_first(mvs_dir, ["scene_dense.mvs", "scene.mvs"])
@@ -480,16 +473,11 @@ def run_openmvs():
     # "deslavada"/borrosa (quitaba demasiada geometría). decimate 0.5
     # (conservar 50%) es el PUNTO MEDIO: reduce el mosaico y conserva detalle.
     #   --decimate 0.5 → de ~2.5M a ~1.2M vértices (entre el exceso y el lavado)
-    # CAMBIO (anti-manchas + más detalle): recorte y suavizado MÁS suaves.
-    #   --decimate 0.7 (antes 0.5): conservar 70% de las caras (antes 50%).
-    #     Más geometría = más detalle, SIN llegar a los 2.5M vértices que
-    #     causaban el mosaico de hexágonos. Es el equilibrio fino.
-    #   --smooth 2 (antes 3): menos suavizado = menos "deslavado".
     run(["ReconstructMesh", dense.name,
          "--close-holes", "100",
          "--remove-spurious", "30",
-         "--decimate", "0.7",
-         "--smooth", "2"],
+         "--decimate", "0.5",
+         "--smooth", "3"],
         TIMEOUTS["mvs_mesh"], "mvs_mesh", cwd=str(mvs_dir))
     mesh = _find_first(mvs_dir, [
         "scene_dense_mesh.ply", "scene_mesh.ply", "scene_dense.ply"])
@@ -546,15 +534,6 @@ def run_openmvs():
     # NOTA: textura en 4096 (NO 8192). Con 8192, LaMa intentaba cargar la
     # imagen completa en la GPU y pedía ~49 GB → CUDA out of memory → crash.
     # 4096 es buena resolución y LaMa la aguanta sin quedarse sin memoria.
-    #
-    # CAMBIO CLAVE (anti-manchas-grises, el más importante):
-    #   --outlier-threshold 0 (antes usaba el por defecto 0.06): DESACTIVA el
-    #   descarte de caras "atípicas". Por defecto, OpenMVS deja SIN textura
-    #   (gris) cualquier cara cuyo color no concuerde bien entre las fotos.
-    #   En un cuarto con iluminación que varía entre tomas, eso rechaza zonas
-    #   reales (sobre todo la VENTANA, que refleja distinto en cada foto) y las
-    #   pinta de gris. Con 0, OpenMVS texturiza todas las caras que tienen al
-    #   menos una foto, en vez de descartarlas por diferencia de color.
     run(["TextureMesh", dense.name,
          "-m", refined.name,
          "--export-type", "obj",
@@ -562,7 +541,6 @@ def run_openmvs():
          "--global-seam-leveling", "1",
          "--local-seam-leveling", "1",
          "--cost-smoothness-ratio", "0.1",
-         "--outlier-threshold", "0",
          "--empty-color", empty_gris,
          "-o", "scene_textured.obj"],
         TIMEOUTS["mvs_texture"], "mvs_texture", cwd=str(mvs_dir))
@@ -979,6 +957,45 @@ def convert_mesh_to_glb(obj_path, glb_path):
     else:
         geoms = [loaded]
         export_obj = loaded
+
+    # ── SUAVIZADO DE NORMALES (anti-TRIÁNGULOS / anti-facetas) ──
+    # CLAVE para que NO se vean los triángulos/hexágonos: una malla siempre
+    # está hecha de triángulos, pero si cada cara usa su propia normal ("flat
+    # shading") se ve facetada. Con "smooth shading" (normales promediadas por
+    # vértice) la luz fluye continua y las superficies se ven lisas y
+    # redondeadas — una almohada se ve redonda, no como triángulos.
+    #
+    # IMPORTANTE: NO fusionamos vértices de forma agresiva, porque eso rompe
+    # las costuras de la textura (la UV) y dañaría el color. En vez de eso,
+    # generamos normales SUAVES por vértice a partir de las caras vecinas y se
+    # las asignamos a la malla, SIN tocar la geometría ni las UV. Esto cambia
+    # solo cómo se ilumina la superficie (el "sombreado"), no su forma.
+    import numpy as _nps
+    for _g in geoms:
+        try:
+            verts = _nps.asarray(_g.vertices)
+            faces = _nps.asarray(_g.faces)
+            if len(verts) == 0 or len(faces) == 0:
+                continue
+            # Normal de cada cara (triángulo)
+            tris = verts[faces]
+            fn = _nps.cross(tris[:, 1] - tris[:, 0], tris[:, 2] - tris[:, 0])
+            ln = _nps.linalg.norm(fn, axis=1, keepdims=True)
+            ln[ln == 0] = 1.0
+            fn = fn / ln
+            # Acumular en cada vértice la normal de TODAS sus caras vecinas
+            # (esto es lo que promedia y suaviza el sombreado)
+            vn = _nps.zeros_like(verts, dtype=_nps.float64)
+            for k in range(3):
+                _nps.add.at(vn, faces[:, k], fn)
+            lvn = _nps.linalg.norm(vn, axis=1, keepdims=True)
+            lvn[lvn == 0] = 1.0
+            vn = vn / lvn
+            # Asignar las normales suaves SIN cambiar vértices/caras/UV
+            _g.vertex_normals = vn
+        except Exception as e:
+            log(f"   (no se pudo suavizar una geometría: {e})", "WARN")
+    log(f"   ✓ Normales suavizadas (anti-triángulos) en {len(geoms)} geometría(s)")
 
     # ── FORZAR la textura manualmente sobre cada geometría (anti-blanco) ──
     # Si una geometría tiene UV pero su material quedó sin imagen, le pegamos
