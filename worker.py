@@ -339,55 +339,29 @@ def run_colmap():
     db = COLMAP_DIR / "database.db"
     sparse.mkdir(exist_ok=True)
 
-    # FIX v3.8: COLMAP con SIFT en GPU inicializa OpenGL/Qt y necesita un display.
-    # Lo corremos bajo xvfb (pantalla virtual) para el feature_extractor.
-    # FIX v3.10: el exhaustive_matcher con GPU bajo xvfb SE CUELGA en silencio
-    # (no crashea, no avanza → Timeout 900s). Por eso el matcher va SIEMPRE en CPU,
-    # que con ~50-80 fotos es rápido (~1-2 min) y nunca se cuelga.
-    # El feature_extractor con GPU sí funciona bien (~20s), así que ese queda en GPU.
-    xvfb = _has_xvfb()
-    log(f"xvfb disponible: {xvfb}")
-    sift_gpu = "1" if xvfb else "0"  # sin xvfb, GPU SIFT crashea → usar CPU directo
-
-    try:
-        run(["colmap","feature_extractor",
-             "--database_path", str(db), "--image_path", str(FRAMES_DIR),
-             "--ImageReader.single_camera","1",
-             "--ImageReader.camera_model","OPENCV",
-             # OPTIMIZACIÓN: limitar features por foto (def. 8192 → 4096).
-             # 4096 es generoso (suficiente detalle) y acelera matching+mapper.
-             "--SiftExtraction.max_num_features","4096",
-             # ANTI-OOM: limitar el tamaño que COLMAP carga en RAM (def. 3200).
-             # 2048 reduce MUCHO la memoria sin afectar la ubicación de cámaras
-             # (COLMAP solo localiza la cámara; la textura la pone OpenMVS con
-             # las fotos completas después). Evita que el pod muera por memoria.
-             "--SiftExtraction.max_image_size","2048",
-             "--SiftExtraction.use_gpu", sift_gpu],
-            TIMEOUTS["colmap_feature"], "features", use_xvfb=xvfb)
-        # Matcher SIEMPRE en CPU (use_gpu=0): evita el cuelgue de GPU+xvfb.
-        run(["colmap","exhaustive_matcher",
-             "--database_path", str(db),
-             "--SiftMatching.use_gpu","0"],
-            TIMEOUTS["colmap_match"], "matching-cpu")
-    except (RuntimeError, Timeout) as e:
-        # Fallback: reintentar TODO con SIFT en CPU (sin GPU, sin Qt).
-        # Ahora atrapa también Timeout, no solo RuntimeError.
-        log(f"COLMAP falló ({e}); reintentando TODO con SIFT en CPU...", "WARN")
-        if db.exists(): db.unlink()
-        run(["colmap","feature_extractor",
-             "--database_path", str(db), "--image_path", str(FRAMES_DIR),
-             "--ImageReader.single_camera","1",
-             "--ImageReader.camera_model","OPENCV",
-             "--SiftExtraction.max_num_features","4096",
-             # Mismo límite anti-OOM en el reintento por CPU (aquí es donde
-             # murió antes con rc=-9 por falta de memoria).
-             "--SiftExtraction.max_image_size","2048",
-             "--SiftExtraction.use_gpu","0"],
-            TIMEOUTS["colmap_feature"], "features-cpu")
-        run(["colmap","exhaustive_matcher",
-             "--database_path", str(db),
-             "--SiftMatching.use_gpu","0"],
-            TIMEOUTS["colmap_match"], "matching-cpu2")
+    # ── ESTRATEGIA ANTI-OOM (rc=-9) ──
+    # PROBLEMA detectado: el intento con GPU+xvfb abortaba (rc=134) y dejaba
+    # memoria/procesos a medio morir; el reintento en CPU arrancaba con la RAM
+    # ya comprometida y MORÍA por falta de memoria (rc=-9). Con la imagen v2
+    # (más pesada) esto pasaba SIEMPRE, aunque antes funcionaba.
+    # SOLUCIÓN: ir DIRECTO a CPU una sola vez, con memoria limpia y parámetros
+    # livianos (resolución 1600 + 4096 features). COLMAP solo ubica las cámaras,
+    # así que bajar resolución NO afecta la calidad final (la textura la pone
+    # OpenMVS con las fotos completas). Esto usa MUCHA menos RAM y no se cae.
+    log("COLMAP: SIFT en CPU directo (modo liviano anti-memoria)")
+    run(["colmap","feature_extractor",
+         "--database_path", str(db), "--image_path", str(FRAMES_DIR),
+         "--ImageReader.single_camera","1",
+         "--ImageReader.camera_model","OPENCV",
+         "--SiftExtraction.max_num_features","4096",
+         # Resolución contenida para no agotar RAM en pods con poca memoria.
+         "--SiftExtraction.max_image_size","1600",
+         "--SiftExtraction.use_gpu","0"],
+        TIMEOUTS["colmap_feature"], "features-cpu")
+    run(["colmap","exhaustive_matcher",
+         "--database_path", str(db),
+         "--SiftMatching.use_gpu","0"],
+        TIMEOUTS["colmap_match"], "matching-cpu")
 
     run(["colmap","mapper",
          "--database_path", str(db),
