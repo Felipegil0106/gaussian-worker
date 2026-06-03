@@ -573,14 +573,13 @@ def run_openmvs():
             log(f"   nube de entrada: {_n_pts:,} puntos")
             mem_info("nube-cargada")
             # ── DETALLE / MEMORIA ──
-            # Subimos de 80k a 150k puntos para MÁS DETALLE (formas más finas,
-            # menos redondeo). Antes 150k se colgaba, PERO eso era por las
-            # normales sin orientar (ya arreglado); con normales bien orientadas
-            # Poisson aguanta 150k sin colgarse (tarda ~1-3 min, no 13s, pero
-            # bien dentro del límite de seguridad). NO subimos también el depth:
-            # cambiar las dos cosas a la vez dispararía la RAM y el tiempo.
-            # Selección aleatoria precisa para respetar el objetivo.
-            _LIMITE_SEGURO = 150000
+            # Subimos a 300k puntos (el doble de 150k) para MÁS DETALLE. A 150k
+            # corrió rápido, así que hay margen. Con normales bien orientadas
+            # Poisson aguanta 300k (tardará más, quizás 5-10 min, pero sigue muy
+            # por debajo del límite de 40 min). NO subimos el depth: cambiar dos
+            # cosas geométricas a la vez dispararía la RAM. Si 300k pesa mucho o
+            # tarda de más, bajamos. Selección aleatoria precisa.
+            _LIMITE_SEGURO = 300000
             if _n_pts > _LIMITE_SEGURO:
                 _idx = _npp.random.choice(_n_pts, _LIMITE_SEGURO, replace=False)
                 _pcd = _pcd.select_by_index(list(_idx))
@@ -987,26 +986,15 @@ def limpiar_puntos_colores(img_bgr):
 
 
 def realce_suave(img_bgr):
-    """OPCIÓN 1 — aclara las zonas OSCURAS (sombras) sin quemar las claras.
-    Es nuestro arreglo de las manchas oscuras SIN tocar el texturizado (así no
-    puede causar el crash del seam-leveling). Dos pasos:
-      1) Curva 'gamma' (<1) que LEVANTA las sombras: sube mucho el brillo de los
-         píxeles oscuros y casi nada el de los claros → no se quema lo brillante.
-      2) Contraste local suave (CLAHE) para recuperar definición.
-    Trabaja solo sobre la luz (canal L de LAB), así NO satura ni cambia colores.
-    """
+    """Realce de contraste local SUAVE (CLAHE) para que las zonas 'deslavadas'
+    recuperen algo de definición, sin exagerar ni saturar colores.
+    (Volvimos al ORIGINAL: la Opción 1 que levantaba sombras con gamma se veía
+    un poco mal, así que la quitamos.)"""
     try:
         import cv2
-        import numpy as np
         lab = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2LAB)
         l, a, b = cv2.split(lab)
-        # 1) levantar sombras (gamma 0.80: aclara oscuros, respeta claros)
-        gamma = 0.80
-        lut = np.array([((i / 255.0) ** gamma) * 255 for i in range(256)],
-                       dtype=np.uint8)
-        l = cv2.LUT(l, lut)
-        # 2) contraste local suave (un poco más que antes: 1.5 → 2.0)
-        clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
+        clahe = cv2.createCLAHE(clipLimit=1.5, tileGridSize=(8, 8))
         l = clahe.apply(l)
         return cv2.cvtColor(cv2.merge([l, a, b]), cv2.COLOR_LAB2BGR)
     except Exception:
