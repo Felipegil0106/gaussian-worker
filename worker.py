@@ -532,7 +532,16 @@ def run_openmvs():
     # lo hicimos rápido (reutilizar normales de OpenMVS + 80k puntos + depth 8),
     # así corre en pocos minutos. El heartbeat de fondo (cada 30s) mantiene vivo
     # al pod mientras Poisson trabaja, así que el backend no lo mata por timeout.
-    USAR_POISSON = True
+    # ⚙️ OPCIÓN 3 (prueba actual): USAR_POISSON = False.
+    # Apagamos Poisson temporalmente para texturizar la malla NATIVA de OpenMVS
+    # (scene_dense_mesh.ply). Esa malla SÍ trae los datos de visibilidad que el
+    # seam-leveling necesita, así que el texturizado NO debería crashear, y el
+    # color sale mejor (brillo equilibrado + menos zonas grises, porque la malla
+    # coincide con dónde las fotos vieron la superficie). El costo: vuelven
+    # algunas facetas (perdemos la suavidad de Poisson).
+    # NADA SE BORRA: todo el código de Poisson queda intacto abajo. Para volver
+    # a Poisson (Opciones 1/2) basta poner USAR_POISSON = True otra vez.
+    USAR_POISSON = False
     if USAR_POISSON:
         try:
             log("OpenMVS 3b/5: Reconstrucción de superficie Poisson (anti-facetas)...")
@@ -720,6 +729,13 @@ def run_openmvs():
     #   genera la textura igual (puede que con costuras de color algo visibles,
     #   pero el render TERMINA y sale el .glb). La calidad de costuras se puede
     #   recuperar después; ahora la prioridad es obtener el archivo final.
+    # ⚙️ SEAM LEVELING REACTIVADO (Opción 3):
+    #   Lo habíamos apagado porque crasheaba con la malla EXTERNA de Poisson.
+    #   Ahora texturizamos la malla NATIVA de OpenMVS (USAR_POISSON=False), que
+    #   sí trae los datos de visibilidad que el seam-leveling necesita. Así que
+    #   lo encendemos: iguala el BRILLO entre fotos (arregla las zonas oscuras)
+    #   y suaviza las costuras de color entre parches. Si por algo volviera a
+    #   crashear aquí, el pod se corta y me pasas el log → vamos a Opción 2 o 1.
     empty_gris = str(0xBEBEBE)  # gris claro en decimal = 12500670
     log("OpenMVS 5/5: TextureMesh (color + relleno gris, NO negro)...")
     # CONTRA EL EFECTO "DESLAVADO"/BORROSO:
@@ -731,8 +747,8 @@ def run_openmvs():
          "-m", refined.name,
          "--export-type", "obj",
          "--max-texture-size", "4096",
-         "--global-seam-leveling", "0",
-         "--local-seam-leveling", "0",
+         "--global-seam-leveling", "1",
+         "--local-seam-leveling", "1",
          "--cost-smoothness-ratio", "0.1",
          "--empty-color", empty_gris,
          "-o", "scene_textured.obj"],
