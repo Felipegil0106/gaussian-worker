@@ -516,8 +516,7 @@ def run_openmvs():
                 _pip_install(["open3d"], intentos=3, timeout=900, obligatorio=False)
                 import open3d as o3d
             import numpy as _npp
-            # Heartbeat explícito ANTES de empezar (Poisson tarda; avisamos que
-            # seguimos vivos para que el backend no nos mate por timeout).
+            # Heartbeat explícito ANTES de empezar.
             callback({"type":"progress", "progress":_current_progress,
                       "message":"Poisson: preparando nube...", "log": full_log()})
             _src = o3d.io.read_triangle_mesh(str(mesh))
@@ -526,30 +525,35 @@ def run_openmvs():
             _pcd.points = _src.vertices
             if _src.has_vertex_normals():
                 _pcd.normals = _src.vertex_normals
-            # SEGURIDAD DE MEMORIA: si la nube es enorme, la reducimos con un
-            # voxel (rejilla). Esto baja muchísimo el uso de RAM SIN perder
-            # calidad real: Poisson genera la superficie suave igual. Una nube
-            # de >400k puntos puede agotar la memoria del pod y matarlo.
             _n_pts = len(_pcd.points)
             log(f"   nube de entrada: {_n_pts:,} puntos")
-            if _n_pts > 400000:
-                # tamaño de voxel adaptativo según el tamaño de la escena
-                _bbox = _pcd.get_axis_aligned_bounding_box()
-                _diag = _npp.linalg.norm(_bbox.get_extent())
-                _voxel = max(_diag / 800.0, 1e-6)
-                _pcd = _pcd.voxel_down_sample(voxel_size=_voxel)
-                log(f"   nube reducida con voxel a {len(_pcd.points):,} puntos")
-                # Tope FIRME: si tras el voxel sigue muy grande, submuestreo
-                # uniforme garantizado a ~350k (evita agotar RAM sí o sí).
-                if len(_pcd.points) > 350000:
-                    _every = int(len(_pcd.points) / 350000) + 1
-                    _pcd = _pcd.uniform_down_sample(_every)
-                    log(f"   nube acotada a {len(_pcd.points):,} puntos (tope de memoria)")
-            # Estimar/orientar normales si hicieron falta
+            # ── SEGURIDAD DE MEMORIA (CRÍTICO) ──
+            # El paso de orientar normales y Poisson consumen MUCHÍSIMA RAM.
+            # Con ~200k puntos el pod se quedaba sin memoria y MORÍA de golpe
+            # (OOM). Por eso reducimos SIEMPRE la nube a un tamaño seguro
+            # (~120k puntos). Poisson genera la superficie suave igual de bien
+            # con 120k que con 200k — la calidad final NO cambia de forma
+            # apreciable, pero ya NO revienta la memoria.
+            _LIMITE_SEGURO = 120000
+            if _n_pts > _LIMITE_SEGURO:
+                _every = int(_n_pts / _LIMITE_SEGURO) + 1
+                _pcd = _pcd.uniform_down_sample(_every)
+                log(f"   nube reducida a {len(_pcd.points):,} puntos (seguridad de memoria)")
+            callback({"type":"progress", "progress":_current_progress,
+                      "message":"Poisson: estimando normales...", "log": full_log()})
+            # Estimar normales (rápido) y orientarlas hacia un punto de cámara.
+            # NOTA: NO usamos orient_normals_consistent_tangent_plane porque ese
+            # método es el que reventaba la RAM (construye un grafo enorme).
+            # En su lugar, estimamos normales y las orientamos de forma simple,
+            # que es MUCHO más liviano y suficiente para Poisson.
             if not _pcd.has_normals():
                 _pcd.estimate_normals(
-                    search_param=o3d.geometry.KDTreeSearchParamHybrid(radius=0.1, max_nn=30))
-            _pcd.orient_normals_consistent_tangent_plane(15)
+                    search_param=o3d.geometry.KDTreeSearchParamKNN(knn=30))
+            _pcd.normalize_normals()
+            try:
+                _pcd.orient_normals_towards_camera_location(_pcd.get_center())
+            except Exception:
+                pass
             callback({"type":"progress", "progress":_current_progress,
                       "message":"Poisson: reconstruyendo superficie...", "log": full_log()})
             # depth 9 = buen detalle. Mantiene calidad alta.
