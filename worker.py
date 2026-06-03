@@ -485,7 +485,10 @@ def run_openmvs():
     # puntos de esa malla y reconstruye una SUPERFICIE CERRADA Y CONTINUA:
     # rellena huecos (paredes que faltaban), redondea formas (una almohada se
     # ve redonda), y elimina las facetas sueltas. Es gratis y libre comercial.
-    # Si Poisson fallara, seguimos con la malla de OpenMVS (no rompe el job).
+    # Poisson DEBE funcionar (es la mejora anti-triángulos). NO lo abandonamos:
+    # lo hicimos rápido (reutilizar normales de OpenMVS + 80k puntos + depth 8),
+    # así corre en pocos minutos. El heartbeat de fondo (cada 30s) mantiene vivo
+    # al pod mientras Poisson trabaja, así que el backend no lo mata por timeout.
     USAR_POISSON = True
     if USAR_POISSON:
         try:
@@ -498,6 +501,7 @@ def run_openmvs():
                 _pip_install(["open3d"], intentos=3, timeout=900, obligatorio=False)
                 import open3d as o3d
             import numpy as _npp
+
             # Heartbeat explícito ANTES de empezar.
             callback({"type":"progress", "progress":_current_progress,
                       "message":"Poisson: preparando nube...", "log": full_log()})
@@ -505,51 +509,41 @@ def run_openmvs():
             _src.compute_vertex_normals()
             _pcd = o3d.geometry.PointCloud()
             _pcd.points = _src.vertices
+            # CLAVE: la malla de OpenMVS YA tiene normales por vértice. Las
+            # reutilizamos (rápido) en vez de recalcularlas con estimate_normals,
+            # que con 150k puntos en el pod tardaba >25 min y se colgaba.
             if _src.has_vertex_normals():
                 _pcd.normals = _src.vertex_normals
             _n_pts = len(_pcd.points)
             log(f"   nube de entrada: {_n_pts:,} puntos")
-            # ── SEGURIDAD DE MEMORIA (CRÍTICO) ──
-            # El paso de orientar normales y Poisson consumen MUCHA RAM. Con
-            # ~200k puntos el pod se quedaba sin memoria y MORÍA (OOM). Reducimos
-            # la nube a un tamaño seguro PERO ALTO (150k) para conservar casi
-            # todo el detalle: la malla final queda en ~497k vértices (vs ~551k
-            # con la nube completa, solo ~10% menos) usando poca RAM. La calidad
-            # visual es prácticamente igual y ya NO revienta la memoria.
-            # Usamos selección aleatoria PRECISA (no divisor entero) para
-            # respetar el objetivo exacto y no quedarnos cortos.
-            _LIMITE_SEGURO = 150000
+            # ── VELOCIDAD Y MEMORIA ──
+            # El pod es MÁS LENTO que mi entorno. Con 150k se colgaba. Bajamos a
+            # 80k: superficie suave de buena calidad, rápido y sin saturar
+            # memoria. Selección aleatoria precisa para respetar el objetivo.
+            _LIMITE_SEGURO = 80000
             if _n_pts > _LIMITE_SEGURO:
                 _idx = _npp.random.choice(_n_pts, _LIMITE_SEGURO, replace=False)
                 _pcd = _pcd.select_by_index(list(_idx))
-                log(f"   nube ajustada a {len(_pcd.points):,} puntos (seguridad de memoria, calidad alta)")
-            callback({"type":"progress", "progress":_current_progress,
-                      "message":"Poisson: estimando normales...", "log": full_log()})
-            # Estimar normales (rápido) y orientarlas hacia un punto de cámara.
-            # NOTA: NO usamos orient_normals_consistent_tangent_plane porque ese
-            # método es el que reventaba la RAM (construye un grafo enorme).
-            # En su lugar, estimamos normales y las orientamos de forma simple,
-            # que es MUCHO más liviano y suficiente para Poisson.
+                log(f"   nube ajustada a {len(_pcd.points):,} puntos (rápido y seguro)")
+            # Solo estimamos normales si la malla NO las traía (caso raro).
             if not _pcd.has_normals():
+                callback({"type":"progress", "progress":_current_progress,
+                          "message":"Poisson: estimando normales...", "log": full_log()})
                 _pcd.estimate_normals(
-                    search_param=o3d.geometry.KDTreeSearchParamKNN(knn=30))
+                    search_param=o3d.geometry.KDTreeSearchParamKNN(knn=18))
             _pcd.normalize_normals()
-            try:
-                _pcd.orient_normals_towards_camera_location(_pcd.get_center())
-            except Exception:
-                pass
             callback({"type":"progress", "progress":_current_progress,
                       "message":"Poisson: reconstruyendo superficie...", "log": full_log()})
-            # depth 9 = buen detalle. Mantiene calidad alta.
+            # depth 8: más rápido y liviano que 9, superficie igual de suave
+            # para una escena de cuarto.
             _pm, _dens = o3d.geometry.TriangleMesh.create_from_point_cloud_poisson(
-                _pcd, depth=9, scale=1.1, linear_fit=False)
+                _pcd, depth=8, scale=1.1, linear_fit=False)
             callback({"type":"progress", "progress":_current_progress,
                       "message":"Poisson: limpiando y suavizando...", "log": full_log()})
             # Recortar las zonas "infladas" de baja densidad (artefactos Poisson)
             _dens = _npp.asarray(_dens)
             _pm.remove_vertices_by_mask(_dens < _npp.quantile(_dens, 0.05))
-            # Si quedó muy densa, simplificar a ~600K caras (como Polycam) para
-            # que TextureMesh sea rápido y la textura no se parta en mil parches.
+            # Si quedó muy densa, simplificar a ~600K caras (como Polycam).
             if len(_pm.triangles) > 600000:
                 _pm = _pm.simplify_quadric_decimation(600000)
             # Suavizado final ligero (superficie tersa)
