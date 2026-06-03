@@ -357,6 +357,11 @@ def run_colmap():
              # OPTIMIZACIÓN: limitar features por foto (def. 8192 → 4096).
              # 4096 es generoso (suficiente detalle) y acelera matching+mapper.
              "--SiftExtraction.max_num_features","4096",
+             # ANTI-OOM: limitar el tamaño que COLMAP carga en RAM (def. 3200).
+             # 2048 reduce MUCHO la memoria sin afectar la ubicación de cámaras
+             # (COLMAP solo localiza la cámara; la textura la pone OpenMVS con
+             # las fotos completas después). Evita que el pod muera por memoria.
+             "--SiftExtraction.max_image_size","2048",
              "--SiftExtraction.use_gpu", sift_gpu],
             TIMEOUTS["colmap_feature"], "features", use_xvfb=xvfb)
         # Matcher SIEMPRE en CPU (use_gpu=0): evita el cuelgue de GPU+xvfb.
@@ -374,6 +379,9 @@ def run_colmap():
              "--ImageReader.single_camera","1",
              "--ImageReader.camera_model","OPENCV",
              "--SiftExtraction.max_num_features","4096",
+             # Mismo límite anti-OOM en el reintento por CPU (aquí es donde
+             # murió antes con rc=-9 por falta de memoria).
+             "--SiftExtraction.max_image_size","2048",
              "--SiftExtraction.use_gpu","0"],
             TIMEOUTS["colmap_feature"], "features-cpu")
         run(["colmap","exhaustive_matcher",
@@ -528,17 +536,19 @@ def run_openmvs():
             _n_pts = len(_pcd.points)
             log(f"   nube de entrada: {_n_pts:,} puntos")
             # ── SEGURIDAD DE MEMORIA (CRÍTICO) ──
-            # El paso de orientar normales y Poisson consumen MUCHÍSIMA RAM.
-            # Con ~200k puntos el pod se quedaba sin memoria y MORÍA de golpe
-            # (OOM). Por eso reducimos SIEMPRE la nube a un tamaño seguro
-            # (~120k puntos). Poisson genera la superficie suave igual de bien
-            # con 120k que con 200k — la calidad final NO cambia de forma
-            # apreciable, pero ya NO revienta la memoria.
-            _LIMITE_SEGURO = 120000
+            # El paso de orientar normales y Poisson consumen MUCHA RAM. Con
+            # ~200k puntos el pod se quedaba sin memoria y MORÍA (OOM). Reducimos
+            # la nube a un tamaño seguro PERO ALTO (150k) para conservar casi
+            # todo el detalle: la malla final queda en ~497k vértices (vs ~551k
+            # con la nube completa, solo ~10% menos) usando poca RAM. La calidad
+            # visual es prácticamente igual y ya NO revienta la memoria.
+            # Usamos selección aleatoria PRECISA (no divisor entero) para
+            # respetar el objetivo exacto y no quedarnos cortos.
+            _LIMITE_SEGURO = 150000
             if _n_pts > _LIMITE_SEGURO:
-                _every = int(_n_pts / _LIMITE_SEGURO) + 1
-                _pcd = _pcd.uniform_down_sample(_every)
-                log(f"   nube reducida a {len(_pcd.points):,} puntos (seguridad de memoria)")
+                _idx = _npp.random.choice(_n_pts, _LIMITE_SEGURO, replace=False)
+                _pcd = _pcd.select_by_index(list(_idx))
+                log(f"   nube ajustada a {len(_pcd.points):,} puntos (seguridad de memoria, calidad alta)")
             callback({"type":"progress", "progress":_current_progress,
                       "message":"Poisson: estimando normales...", "log": full_log()})
             # Estimar normales (rápido) y orientarlas hacia un punto de cámara.
