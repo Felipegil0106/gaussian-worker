@@ -77,7 +77,11 @@ for d in (RAW_DIR, FRAMES_DIR, COLMAP_DIR, RESULT_DIR):
 # LOGGING (buffer para mandar al backend si hay error)
 # ══════════════════════════════════════════════════════════════
 
-_LOG = deque(maxlen=500)
+# LOG COMPLETO: antes limitábamos a las últimas 500 líneas (deque maxlen=500),
+# lo que ocultaba el inicio del proceso. Para DIAGNOSTICAR de verdad, ahora
+# guardamos TODAS las líneas (lista normal, sin límite). Así se ve absolutamente
+# todo lo que el worker hace, de principio a fin, y todo se guarda y se descarga.
+_LOG = []
 _t0 = time.time()
 _current_progress = 0.0
 _current_message = "Iniciando..."
@@ -90,6 +94,38 @@ def log(msg, lv="INFO"):
 
 def full_log():
     return "\n".join(_LOG)
+
+def mem_info(etiqueta=""):
+    """Mide y registra la memoria RAM del sistema (para DIAGNÓSTICO).
+    Lee /proc/meminfo (siempre disponible en Linux, sin librerías extra).
+    Así sabemos EXACTAMENTE cuánta memoria hay libre en cada punto crítico,
+    para confirmar o descartar si el problema es falta de memoria (OOM)."""
+    try:
+        info = {}
+        with open("/proc/meminfo") as f:
+            for ln in f:
+                parts = ln.split(":")
+                if len(parts) == 2:
+                    k = parts[0].strip()
+                    v = parts[1].strip().split()[0]  # en kB
+                    info[k] = int(v)
+        total_gb = info.get("MemTotal", 0) / 1024 / 1024
+        avail_gb = info.get("MemAvailable", 0) / 1024 / 1024
+        usada_gb = total_gb - avail_gb
+        # memoria del proceso actual (VmRSS)
+        proc_gb = 0.0
+        try:
+            with open("/proc/self/status") as f:
+                for ln in f:
+                    if ln.startswith("VmRSS:"):
+                        proc_gb = int(ln.split()[1]) / 1024 / 1024
+                        break
+        except Exception:
+            pass
+        log(f"[MEMORIA {etiqueta}] total={total_gb:.1f}GB usada={usada_gb:.1f}GB "
+            f"libre={avail_gb:.1f}GB proceso={proc_gb:.2f}GB")
+    except Exception as e:
+        log(f"[MEMORIA {etiqueta}] no se pudo medir: {e}", "WARN")
 
 # ══════════════════════════════════════════════════════════════
 # CALLBACK con firma HMAC (igual que Vessel)
@@ -164,8 +200,15 @@ def run(cmd, timeout, name="", use_xvfb=False, cwd=None):
         r = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout, check=False, cwd=cwd)
     except subprocess.TimeoutExpired:
         raise Timeout(f"Timeout {name} ({timeout}s)")
+    # LOG COMPLETO: registramos TODA la salida del comando (stdout + stderr),
+    # no solo las últimas líneas. Así, ante cualquier problema, vemos el detalle
+    # completo de lo que el programa dijo, no un recorte que esconde la causa.
+    if r.stdout and r.stdout.strip():
+        log(f"[{name}] salida:\n{r.stdout.strip()}")
+    if r.stderr and r.stderr.strip():
+        log(f"[{name}] mensajes:\n{r.stderr.strip()}")
     if r.returncode != 0:
-        err = "\n".join(r.stderr.split("\n")[-15:])
+        err = r.stderr or r.stdout or "(sin salida)"
         raise RuntimeError(f"[{name}] rc={r.returncode}\n{err}")
     return r.stdout
 
@@ -505,8 +548,12 @@ def run_openmvs():
             # Heartbeat explícito ANTES de empezar.
             callback({"type":"progress", "progress":_current_progress,
                       "message":"Poisson: preparando nube...", "log": full_log()})
+            mem_info("inicio-Poisson")
+            log("   [Poisson] leyendo malla de OpenMVS...")
+            _t_p = time.time()
             _src = o3d.io.read_triangle_mesh(str(mesh))
             _src.compute_vertex_normals()
+            log(f"   [Poisson] malla leída en {time.time()-_t_p:.1f}s")
             _pcd = o3d.geometry.PointCloud()
             _pcd.points = _src.vertices
             # CLAVE: la malla de OpenMVS YA tiene normales por vértice. Las
@@ -514,8 +561,12 @@ def run_openmvs():
             # que con 150k puntos en el pod tardaba >25 min y se colgaba.
             if _src.has_vertex_normals():
                 _pcd.normals = _src.vertex_normals
+                log("   [Poisson] reutilizando normales de OpenMVS (rápido)")
+            else:
+                log("   [Poisson] la malla NO trae normales; habrá que estimarlas")
             _n_pts = len(_pcd.points)
             log(f"   nube de entrada: {_n_pts:,} puntos")
+            mem_info("nube-cargada")
             # ── VELOCIDAD Y MEMORIA ──
             # El pod es MÁS LENTO que mi entorno. Con 150k se colgaba. Bajamos a
             # 80k: superficie suave de buena calidad, rápido y sin saturar
@@ -525,30 +576,44 @@ def run_openmvs():
                 _idx = _npp.random.choice(_n_pts, _LIMITE_SEGURO, replace=False)
                 _pcd = _pcd.select_by_index(list(_idx))
                 log(f"   nube ajustada a {len(_pcd.points):,} puntos (rápido y seguro)")
+            mem_info("nube-ajustada")
             # Solo estimamos normales si la malla NO las traía (caso raro).
             if not _pcd.has_normals():
                 callback({"type":"progress", "progress":_current_progress,
                           "message":"Poisson: estimando normales...", "log": full_log()})
+                log("   [Poisson] estimando normales (esto puede tardar)...")
+                _t_n = time.time()
                 _pcd.estimate_normals(
                     search_param=o3d.geometry.KDTreeSearchParamKNN(knn=18))
+                log(f"   [Poisson] normales estimadas en {time.time()-_t_n:.1f}s")
+                mem_info("normales-estimadas")
             _pcd.normalize_normals()
             callback({"type":"progress", "progress":_current_progress,
                       "message":"Poisson: reconstruyendo superficie...", "log": full_log()})
             # depth 8: más rápido y liviano que 9, superficie igual de suave
             # para una escena de cuarto.
+            log("   [Poisson] INICIANDO create_from_point_cloud_poisson (depth=8)...")
+            log("   [Poisson] (si se traba, es AQUÍ; mira la memoria de abajo)")
+            mem_info("antes-de-poisson")
+            _t_pois = time.time()
             _pm, _dens = o3d.geometry.TriangleMesh.create_from_point_cloud_poisson(
                 _pcd, depth=8, scale=1.1, linear_fit=False)
+            log(f"   [Poisson] create_from_point_cloud_poisson TERMINÓ en {time.time()-_t_pois:.1f}s")
+            mem_info("despues-de-poisson")
             callback({"type":"progress", "progress":_current_progress,
                       "message":"Poisson: limpiando y suavizando...", "log": full_log()})
             # Recortar las zonas "infladas" de baja densidad (artefactos Poisson)
             _dens = _npp.asarray(_dens)
             _pm.remove_vertices_by_mask(_dens < _npp.quantile(_dens, 0.05))
+            log(f"   [Poisson] tras recortar baja densidad: {len(_pm.vertices):,} vértices")
             # Si quedó muy densa, simplificar a ~600K caras (como Polycam).
             if len(_pm.triangles) > 600000:
+                log("   [Poisson] simplificando a 600k caras...")
                 _pm = _pm.simplify_quadric_decimation(600000)
             # Suavizado final ligero (superficie tersa)
             _pm = _pm.filter_smooth_simple(number_of_iterations=2)
             _pm.compute_vertex_normals()
+            mem_info("fin-Poisson")
             _poisson_path = mvs_dir / "scene_poisson.ply"
             o3d.io.write_triangle_mesh(str(_poisson_path), _pm)
             if _poisson_path.exists() and len(_pm.vertices) > 1000:
