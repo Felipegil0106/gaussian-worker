@@ -132,9 +132,14 @@ def report(progress, message):
     callback({"type":"progress", "progress":progress, "message":message})
 
 def heartbeat_loop():
+    # El heartbeat ahora MANDA EL LOG acumulado en cada latido. Así, si el pod
+    # muere de golpe (p.ej. Poisson se queda sin memoria), el backend ya tiene
+    # el log hasta donde llegó, y se puede descargar completo. Antes el log solo
+    # se mandaba al final → si el pod moría, el log se perdía ("Sin log").
     while _keep_heartbeat:
         try:
-            callback({"type":"progress", "progress":_current_progress, "message":_current_message})
+            callback({"type":"progress", "progress":_current_progress,
+                      "message":_current_message, "log": full_log()})
         except: pass
         time.sleep(30)
 
@@ -503,21 +508,55 @@ def run_openmvs():
     if USAR_POISSON:
         try:
             log("OpenMVS 3b/5: Reconstrucción de superficie Poisson (anti-facetas)...")
-            import open3d as o3d
+            # open3d ya viene en la imagen v2. Si no estuviera, intento instalarlo.
+            try:
+                import open3d as o3d
+            except Exception:
+                log("   instalando open3d (necesario para Poisson)...")
+                _pip_install(["open3d"], intentos=3, timeout=900, obligatorio=False)
+                import open3d as o3d
             import numpy as _npp
+            # Heartbeat explícito ANTES de empezar (Poisson tarda; avisamos que
+            # seguimos vivos para que el backend no nos mate por timeout).
+            callback({"type":"progress", "progress":_current_progress,
+                      "message":"Poisson: preparando nube...", "log": full_log()})
             _src = o3d.io.read_triangle_mesh(str(mesh))
             _src.compute_vertex_normals()
             _pcd = o3d.geometry.PointCloud()
             _pcd.points = _src.vertices
             if _src.has_vertex_normals():
                 _pcd.normals = _src.vertex_normals
-            else:
+            # SEGURIDAD DE MEMORIA: si la nube es enorme, la reducimos con un
+            # voxel (rejilla). Esto baja muchísimo el uso de RAM SIN perder
+            # calidad real: Poisson genera la superficie suave igual. Una nube
+            # de >400k puntos puede agotar la memoria del pod y matarlo.
+            _n_pts = len(_pcd.points)
+            log(f"   nube de entrada: {_n_pts:,} puntos")
+            if _n_pts > 400000:
+                # tamaño de voxel adaptativo según el tamaño de la escena
+                _bbox = _pcd.get_axis_aligned_bounding_box()
+                _diag = _npp.linalg.norm(_bbox.get_extent())
+                _voxel = max(_diag / 800.0, 1e-6)
+                _pcd = _pcd.voxel_down_sample(voxel_size=_voxel)
+                log(f"   nube reducida con voxel a {len(_pcd.points):,} puntos")
+                # Tope FIRME: si tras el voxel sigue muy grande, submuestreo
+                # uniforme garantizado a ~350k (evita agotar RAM sí o sí).
+                if len(_pcd.points) > 350000:
+                    _every = int(len(_pcd.points) / 350000) + 1
+                    _pcd = _pcd.uniform_down_sample(_every)
+                    log(f"   nube acotada a {len(_pcd.points):,} puntos (tope de memoria)")
+            # Estimar/orientar normales si hicieron falta
+            if not _pcd.has_normals():
                 _pcd.estimate_normals(
                     search_param=o3d.geometry.KDTreeSearchParamHybrid(radius=0.1, max_nn=30))
-            _pcd.orient_normals_consistent_tangent_plane(20)
-            # depth 9 = buen equilibrio detalle/suavidad (subir a 10 = más detalle)
+            _pcd.orient_normals_consistent_tangent_plane(15)
+            callback({"type":"progress", "progress":_current_progress,
+                      "message":"Poisson: reconstruyendo superficie...", "log": full_log()})
+            # depth 9 = buen detalle. Mantiene calidad alta.
             _pm, _dens = o3d.geometry.TriangleMesh.create_from_point_cloud_poisson(
                 _pcd, depth=9, scale=1.1, linear_fit=False)
+            callback({"type":"progress", "progress":_current_progress,
+                      "message":"Poisson: limpiando y suavizando...", "log": full_log()})
             # Recortar las zonas "infladas" de baja densidad (artefactos Poisson)
             _dens = _npp.asarray(_dens)
             _pm.remove_vertices_by_mask(_dens < _npp.quantile(_dens, 0.05))
@@ -672,19 +711,6 @@ def _instalar_dependencias_ia():
     mandará el log, según lo pedido: atacar el problema apenas surja).
     No forzamos versión de torch si la imagen ya lo trae (para no romper CUDA)."""
     global _LAMA_MODEL, _ESRGAN_MODEL
-
-    # open3d: necesario para la reconstrucción de superficie Poisson (anti-facetas).
-    # Lo instalamos primero porque el pipeline de malla ahora depende de él.
-    try:
-        import open3d  # noqa
-    except Exception:
-        log("   Instalando open3d (para superficie Poisson anti-triángulos)...")
-        _pip_install(["open3d"], intentos=3, timeout=900, obligatorio=False)
-        try:
-            import open3d  # noqa
-            log("   ✓ open3d listo")
-        except Exception:
-            log("   (open3d no se pudo instalar; Poisson se omitirá, sigo con OpenMVS)", "WARN")
 
     tiene_torch = False
     try:
