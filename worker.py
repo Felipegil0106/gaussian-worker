@@ -577,17 +577,39 @@ def run_openmvs():
                 _pcd = _pcd.select_by_index(list(_idx))
                 log(f"   nube ajustada a {len(_pcd.points):,} puntos (rápido y seguro)")
             mem_info("nube-ajustada")
-            # Solo estimamos normales si la malla NO las traía (caso raro).
-            if not _pcd.has_normals():
-                callback({"type":"progress", "progress":_current_progress,
-                          "message":"Poisson: estimando normales...", "log": full_log()})
-                log("   [Poisson] estimando normales (esto puede tardar)...")
-                _t_n = time.time()
-                _pcd.estimate_normals(
-                    search_param=o3d.geometry.KDTreeSearchParamKNN(knn=18))
-                log(f"   [Poisson] normales estimadas en {time.time()-_t_n:.1f}s")
-                mem_info("normales-estimadas")
+            # ── ARREGLO DE NORMALES (la causa real del cuelgue) ──
+            # El diagnóstico confirmó: NO era memoria (921 GB libres). Poisson
+            # se colgaba con la nube real. Causa probable: las normales que
+            # reutilizamos de OpenMVS estaban en mal estado (sin orientación
+            # coherente, o con valores raros) → Poisson entra en bucle infinito.
+            # SOLUCIÓN: siempre re-estimar Y orientar las normales de forma
+            # coherente antes de Poisson. Con 80k puntos esto es rápido.
+            callback({"type":"progress", "progress":_current_progress,
+                      "message":"Poisson: preparando normales...", "log": full_log()})
+            log("   [Poisson] re-estimando normales limpias (knn=18)...")
+            _t_n = time.time()
+            _pcd.estimate_normals(
+                search_param=o3d.geometry.KDTreeSearchParamKNN(knn=18))
+            # Orientar las normales de forma coherente (todas hacia afuera).
+            # ESTE paso es el que faltaba: sin él, Poisson no sabe qué lado es
+            # "dentro" y "fuera" y se atasca. Usamos el método liviano (hacia
+            # un punto), NO el pesado (tangent_plane) que reventaba antes.
+            log("   [Poisson] orientando normales (clave para que NO se cuelgue)...")
+            try:
+                _pcd.orient_normals_towards_camera_location(_pcd.get_center())
+            except Exception as _e:
+                log(f"   [Poisson] aviso al orientar: {_e}", "WARN")
             _pcd.normalize_normals()
+            # Verificar que NO haya normales inválidas (NaN), que cuelgan Poisson.
+            _nn = _npp.asarray(_pcd.normals)
+            _malas = _npp.isnan(_nn).any(axis=1)
+            if _malas.any():
+                log(f"   [Poisson] {int(_malas.sum())} normales inválidas (NaN) → limpiando")
+                _buenas = ~_malas
+                _pcd = _pcd.select_by_index(list(_npp.where(_buenas)[0]))
+            log(f"   [Poisson] normales listas en {time.time()-_t_n:.1f}s "
+                f"({len(_pcd.points):,} puntos válidos)")
+            mem_info("normales-listas")
             callback({"type":"progress", "progress":_current_progress,
                       "message":"Poisson: reconstruyendo superficie...", "log": full_log()})
             # depth 8: más rápido y liviano que 9, superficie igual de suave
@@ -596,8 +618,29 @@ def run_openmvs():
             log("   [Poisson] (si se traba, es AQUÍ; mira la memoria de abajo)")
             mem_info("antes-de-poisson")
             _t_pois = time.time()
-            _pm, _dens = o3d.geometry.TriangleMesh.create_from_point_cloud_poisson(
-                _pcd, depth=8, scale=1.1, linear_fit=False)
+            # ── RED DE SEGURIDAD (timeout real) ──
+            # Si las normales arregladas resuelven el cuelgue → Poisson termina
+            # en segundos. PERO por si acaso, lo corremos con un límite de 20 min.
+            # Si se pasa, ABANDONAMOS Poisson y seguimos con la malla de OpenMVS,
+            # para que el render TERMINE pase lo que pase. IMPORTANTE: esto NO
+            # corta el pod — solo deja Poisson de lado y continúa el render
+            # normal con la malla de OpenMVS. El pod sigue vivo y entrega .glb.
+            _pois_out = {}
+            def _correr_poisson():
+                _m, _d = o3d.geometry.TriangleMesh.create_from_point_cloud_poisson(
+                    _pcd, depth=8, scale=1.1, linear_fit=False)
+                _pois_out["mesh"] = _m
+                _pois_out["dens"] = _d
+            _th_pois = threading.Thread(target=_correr_poisson, daemon=True)
+            _th_pois.start()
+            _th_pois.join(timeout=1200)  # 20 minutos de límite de seguridad
+            if _th_pois.is_alive():
+                # Poisson se colgó otra vez → abandonar y usar OpenMVS.
+                log("   [Poisson] NO terminó en 20 min → abandono y sigo con OpenMVS", "WARN")
+                mem_info("poisson-timeout")
+                raise TimeoutError("Poisson excedió 20 min")
+            _pm = _pois_out["mesh"]
+            _dens = _pois_out["dens"]
             log(f"   [Poisson] create_from_point_cloud_poisson TERMINÓ en {time.time()-_t_pois:.1f}s")
             mem_info("despues-de-poisson")
             callback({"type":"progress", "progress":_current_progress,
@@ -621,9 +664,17 @@ def run_openmvs():
                 log(f"   ✓ Superficie Poisson: {len(_pm.vertices):,} vértices, "
                     f"{len(_pm.triangles):,} caras (continua, sin facetas)")
             else:
-                log("   (Poisson no produjo malla válida; sigo con la de OpenMVS)", "WARN")
+                # Poisson NO produjo malla válida → CORTAR el job (no seguir).
+                log("   [Poisson] no produjo malla válida → CORTANDO el render", "ERROR")
+                raise RuntimeError("Poisson no produjo malla válida")
         except Exception as e:
-            log(f"   (Poisson falló: {e}; sigo con la malla de OpenMVS)", "WARN")
+            # CAMBIO solicitado: si Poisson falla, CORTAMOS el job con error
+            # (NO seguimos con OpenMVS). Así no se gasta GPU texturizando una
+            # malla facetada que no queremos, y el log completo queda guardado
+            # para diagnosticar exactamente qué pasó con Poisson.
+            log(f"   [Poisson] FALLÓ: {e}", "ERROR")
+            log("   [Poisson] CORTANDO el render (no se sigue con OpenMVS, por decisión)", "ERROR")
+            raise RuntimeError(f"Poisson falló y el render se detuvo: {e}")
 
     # ── Paso 6.4: RefineMesh → suaviza/mejora ──
     # OPTIMIZACIÓN: desactivado por defecto. En pruebas tardaba ~4.5 min y NO
