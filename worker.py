@@ -532,16 +532,12 @@ def run_openmvs():
     # lo hicimos rápido (reutilizar normales de OpenMVS + 80k puntos + depth 8),
     # así corre en pocos minutos. El heartbeat de fondo (cada 30s) mantiene vivo
     # al pod mientras Poisson trabaja, así que el backend no lo mata por timeout.
-    # ⚙️ OPCIÓN 3 (prueba actual): USAR_POISSON = False.
-    # Apagamos Poisson temporalmente para texturizar la malla NATIVA de OpenMVS
-    # (scene_dense_mesh.ply). Esa malla SÍ trae los datos de visibilidad que el
-    # seam-leveling necesita, así que el texturizado NO debería crashear, y el
-    # color sale mejor (brillo equilibrado + menos zonas grises, porque la malla
-    # coincide con dónde las fotos vieron la superficie). El costo: vuelven
-    # algunas facetas (perdemos la suavidad de Poisson).
-    # NADA SE BORRA: todo el código de Poisson queda intacto abajo. Para volver
-    # a Poisson (Opciones 1/2) basta poner USAR_POISSON = True otra vez.
-    USAR_POISSON = False
+    # ✅ VOLVIMOS A POISSON (USAR_POISSON = True), como en el render que SÍ
+    # gustó. La Opción 3 (apagar Poisson) trajo de vuelta triángulos, ruido de
+    # colores y deformación, porque Poisson era justo el paso que suaviza la
+    # superficie, la cierra/limpia y quita los puntos sueltos. Confirmado:
+    # Poisson es el que da la suavidad. El color lo atacamos por otro lado.
+    USAR_POISSON = True
     if USAR_POISSON:
         try:
             log("OpenMVS 3b/5: Reconstrucción de superficie Poisson (anti-facetas)...")
@@ -664,7 +660,37 @@ def run_openmvs():
                 _pm = _pm.simplify_quadric_decimation(600000)
             # Suavizado final ligero (superficie tersa)
             _pm = _pm.filter_smooth_simple(number_of_iterations=2)
+            # ── LIMPIEZA DE MALLA (Opción 2) — para que el seam-leveling NO crashee ──
+            # El seam-leveling de OpenMVS petaba (std::out_of_range) con la malla
+            # de Poisson porque el recorte de densidad deja aristas no-manifold,
+            # caras degeneradas e islas sueltas. Aquí dejamos la malla "limpia"
+            # y manifold, que es lo que el seam-leveling necesita para no romper.
+            log("   [Poisson] limpiando malla (manifold, sin islas de ruido)...")
+            _pm.remove_degenerate_triangles()
+            _pm.remove_duplicated_triangles()
+            _pm.remove_duplicated_vertices()
+            _pm.remove_non_manifold_edges()
+            _pm.remove_unreferenced_vertices()
+            # Quitar SOLO islas diminutas (ruido flotante de colores), conservando
+            # las paredes y los muebles (no borramos pedazos grandes).
+            try:
+                _cl, _nt, _ar = _pm.cluster_connected_triangles()
+                _cl = _npp.asarray(_cl); _nt = _npp.asarray(_nt)
+                if len(_nt) > 1:
+                    _umbral = max(200, int(0.005 * len(_pm.triangles)))  # <0.5% o <200 caras = ruido
+                    _islas = _npp.where(_nt < _umbral)[0]
+                    if len(_islas) > 0:
+                        _quitar = _npp.isin(_cl, _islas)
+                        _pm.remove_triangles_by_mask(_quitar)
+                        _pm.remove_unreferenced_vertices()
+                        log(f"   [Poisson] quitadas {len(_islas)} islas de ruido "
+                            f"({int(_quitar.sum()):,} caras flotantes)")
+            except Exception as _e:
+                log(f"   [Poisson] aviso al quitar islas: {_e}", "WARN")
+            _pm.remove_non_manifold_edges()  # otra pasada tras quitar islas
             _pm.compute_vertex_normals()
+            log(f"   [Poisson] malla limpia: {len(_pm.vertices):,} vért, "
+                f"{len(_pm.triangles):,} caras")
             mem_info("fin-Poisson")
             _poisson_path = mvs_dir / "scene_poisson.ply"
             o3d.io.write_triangle_mesh(str(_poisson_path), _pm)
@@ -729,13 +755,13 @@ def run_openmvs():
     #   genera la textura igual (puede que con costuras de color algo visibles,
     #   pero el render TERMINA y sale el .glb). La calidad de costuras se puede
     #   recuperar después; ahora la prioridad es obtener el archivo final.
-    # ⚙️ SEAM LEVELING REACTIVADO (Opción 3):
-    #   Lo habíamos apagado porque crasheaba con la malla EXTERNA de Poisson.
-    #   Ahora texturizamos la malla NATIVA de OpenMVS (USAR_POISSON=False), que
-    #   sí trae los datos de visibilidad que el seam-leveling necesita. Así que
-    #   lo encendemos: iguala el BRILLO entre fotos (arregla las zonas oscuras)
-    #   y suaviza las costuras de color entre parches. Si por algo volviera a
-    #   crashear aquí, el pod se corta y me pasas el log → vamos a Opción 2 o 1.
+    # ⚙️ SEAM LEVELING REACTIVADO (Opción 2):
+    #   Antes crasheaba con la malla de Poisson SUCIA. Ahora la malla de Poisson
+    #   va LIMPIA y manifold (ver limpieza arriba), así que el seam-leveling
+    #   debería funcionar: iguala el BRILLO entre fotos (arregla zonas oscuras)
+    #   y suaviza las costuras de color, MANTENIENDO la suavidad de Poisson.
+    #   Si aun así crashea aquí (std::out_of_range), el pod se corta y me pasas
+    #   el log → volvemos al original (Poisson + seam OFF) y de ahí a la Opción 1.
     empty_gris = str(0xBEBEBE)  # gris claro en decimal = 12500670
     log("OpenMVS 5/5: TextureMesh (color + relleno gris, NO negro)...")
     # CONTRA EL EFECTO "DESLAVADO"/BORROSO:
