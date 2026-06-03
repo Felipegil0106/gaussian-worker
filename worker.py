@@ -708,9 +708,18 @@ def run_openmvs():
     # SOLUCIÓN: --empty-color con un GRIS claro (no negro). El valor es un entero
     #   0xRRGGBB; usamos 0xBEBEBE (gris claro ~190) para que las zonas sin foto
     #   se vean GRISES neutras, no negras. Así el render NUNCA se ve negro.
-    #   --global-seam-leveling 1 / --local-seam-leveling 1 → igualan brillo/color
-    #     entre fotos (corrección de iluminación, como Polycam).
     #   --max-texture-size 4096 → archivo liviano que carga bien.
+    #
+    # ⚠️ SEAM LEVELING DESACTIVADO (causa del crash std::out_of_range):
+    #   El seam-leveling (igualar color entre parches) de OpenMVS CRASHEA con
+    #   mallas que NO salieron de su propio ReconstructMesh. Nuestra malla viene
+    #   de Poisson (open3d), que no trae los datos de visibilidad por-vértice que
+    #   el seam-leveling necesita → intenta leer una llave que no existe en su
+    #   mapa interno → std::out_of_range → rc=-6 → crash en el último paso.
+    #   Poniendo global/local seam-leveling en 0, OpenMVS se salta ese paso y
+    #   genera la textura igual (puede que con costuras de color algo visibles,
+    #   pero el render TERMINA y sale el .glb). La calidad de costuras se puede
+    #   recuperar después; ahora la prioridad es obtener el archivo final.
     empty_gris = str(0xBEBEBE)  # gris claro en decimal = 12500670
     log("OpenMVS 5/5: TextureMesh (color + relleno gris, NO negro)...")
     # CONTRA EL EFECTO "DESLAVADO"/BORROSO:
@@ -722,8 +731,8 @@ def run_openmvs():
          "-m", refined.name,
          "--export-type", "obj",
          "--max-texture-size", "4096",
-         "--global-seam-leveling", "1",
-         "--local-seam-leveling", "1",
+         "--global-seam-leveling", "0",
+         "--local-seam-leveling", "0",
          "--cost-smoothness-ratio", "0.1",
          "--empty-color", empty_gris,
          "-o", "scene_textured.obj"],
