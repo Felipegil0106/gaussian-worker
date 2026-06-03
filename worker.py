@@ -572,11 +572,15 @@ def run_openmvs():
             _n_pts = len(_pcd.points)
             log(f"   nube de entrada: {_n_pts:,} puntos")
             mem_info("nube-cargada")
-            # ── VELOCIDAD Y MEMORIA ──
-            # El pod es MÁS LENTO que mi entorno. Con 150k se colgaba. Bajamos a
-            # 80k: superficie suave de buena calidad, rápido y sin saturar
-            # memoria. Selección aleatoria precisa para respetar el objetivo.
-            _LIMITE_SEGURO = 80000
+            # ── DETALLE / MEMORIA ──
+            # Subimos de 80k a 150k puntos para MÁS DETALLE (formas más finas,
+            # menos redondeo). Antes 150k se colgaba, PERO eso era por las
+            # normales sin orientar (ya arreglado); con normales bien orientadas
+            # Poisson aguanta 150k sin colgarse (tarda ~1-3 min, no 13s, pero
+            # bien dentro del límite de seguridad). NO subimos también el depth:
+            # cambiar las dos cosas a la vez dispararía la RAM y el tiempo.
+            # Selección aleatoria precisa para respetar el objetivo.
+            _LIMITE_SEGURO = 150000
             if _n_pts > _LIMITE_SEGURO:
                 _idx = _npp.random.choice(_n_pts, _LIMITE_SEGURO, replace=False)
                 _pcd = _pcd.select_by_index(list(_idx))
@@ -625,11 +629,10 @@ def run_openmvs():
             _t_pois = time.time()
             # ── RED DE SEGURIDAD (timeout real) ──
             # Si las normales arregladas resuelven el cuelgue → Poisson termina
-            # en segundos. PERO por si acaso, lo corremos con un límite de 20 min.
-            # Si se pasa, ABANDONAMOS Poisson y seguimos con la malla de OpenMVS,
-            # para que el render TERMINE pase lo que pase. IMPORTANTE: esto NO
-            # corta el pod — solo deja Poisson de lado y continúa el render
-            # normal con la malla de OpenMVS. El pod sigue vivo y entrega .glb.
+            # en segundos. PERO por si acaso, lo corremos con un límite de 40 min.
+            # A 150k Poisson tarda ~1-3 min, así que 40 min es margen de sobra.
+            # Si se pasara (cuelgue raro), CORTAMOS el render para no quemar tu
+            # saldo: el pod no queda pegado gastando GPU. El log queda guardado.
             _pois_out = {}
             def _correr_poisson():
                 _m, _d = o3d.geometry.TriangleMesh.create_from_point_cloud_poisson(
@@ -638,12 +641,12 @@ def run_openmvs():
                 _pois_out["dens"] = _d
             _th_pois = threading.Thread(target=_correr_poisson, daemon=True)
             _th_pois.start()
-            _th_pois.join(timeout=1200)  # 20 minutos de límite de seguridad
+            _th_pois.join(timeout=2400)  # 40 minutos de límite de seguridad
             if _th_pois.is_alive():
-                # Poisson se colgó otra vez → abandonar y usar OpenMVS.
-                log("   [Poisson] NO terminó en 20 min → abandono y sigo con OpenMVS", "WARN")
+                # Poisson se colgó → cortar el render (red de seguridad de saldo).
+                log("   [Poisson] NO terminó en 40 min → cortando el render", "WARN")
                 mem_info("poisson-timeout")
-                raise TimeoutError("Poisson excedió 20 min")
+                raise TimeoutError("Poisson excedió 40 min")
             _pm = _pois_out["mesh"]
             _dens = _pois_out["dens"]
             log(f"   [Poisson] create_from_point_cloud_poisson TERMINÓ en {time.time()-_t_pois:.1f}s")
