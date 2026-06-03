@@ -660,37 +660,7 @@ def run_openmvs():
                 _pm = _pm.simplify_quadric_decimation(600000)
             # Suavizado final ligero (superficie tersa)
             _pm = _pm.filter_smooth_simple(number_of_iterations=2)
-            # ── LIMPIEZA DE MALLA (Opción 2) — para que el seam-leveling NO crashee ──
-            # El seam-leveling de OpenMVS petaba (std::out_of_range) con la malla
-            # de Poisson porque el recorte de densidad deja aristas no-manifold,
-            # caras degeneradas e islas sueltas. Aquí dejamos la malla "limpia"
-            # y manifold, que es lo que el seam-leveling necesita para no romper.
-            log("   [Poisson] limpiando malla (manifold, sin islas de ruido)...")
-            _pm.remove_degenerate_triangles()
-            _pm.remove_duplicated_triangles()
-            _pm.remove_duplicated_vertices()
-            _pm.remove_non_manifold_edges()
-            _pm.remove_unreferenced_vertices()
-            # Quitar SOLO islas diminutas (ruido flotante de colores), conservando
-            # las paredes y los muebles (no borramos pedazos grandes).
-            try:
-                _cl, _nt, _ar = _pm.cluster_connected_triangles()
-                _cl = _npp.asarray(_cl); _nt = _npp.asarray(_nt)
-                if len(_nt) > 1:
-                    _umbral = max(200, int(0.005 * len(_pm.triangles)))  # <0.5% o <200 caras = ruido
-                    _islas = _npp.where(_nt < _umbral)[0]
-                    if len(_islas) > 0:
-                        _quitar = _npp.isin(_cl, _islas)
-                        _pm.remove_triangles_by_mask(_quitar)
-                        _pm.remove_unreferenced_vertices()
-                        log(f"   [Poisson] quitadas {len(_islas)} islas de ruido "
-                            f"({int(_quitar.sum()):,} caras flotantes)")
-            except Exception as _e:
-                log(f"   [Poisson] aviso al quitar islas: {_e}", "WARN")
-            _pm.remove_non_manifold_edges()  # otra pasada tras quitar islas
             _pm.compute_vertex_normals()
-            log(f"   [Poisson] malla limpia: {len(_pm.vertices):,} vért, "
-                f"{len(_pm.triangles):,} caras")
             mem_info("fin-Poisson")
             _poisson_path = mvs_dir / "scene_poisson.ply"
             o3d.io.write_triangle_mesh(str(_poisson_path), _pm)
@@ -755,13 +725,12 @@ def run_openmvs():
     #   genera la textura igual (puede que con costuras de color algo visibles,
     #   pero el render TERMINA y sale el .glb). La calidad de costuras se puede
     #   recuperar después; ahora la prioridad es obtener el archivo final.
-    # ⚙️ SEAM LEVELING REACTIVADO (Opción 2):
-    #   Antes crasheaba con la malla de Poisson SUCIA. Ahora la malla de Poisson
-    #   va LIMPIA y manifold (ver limpieza arriba), así que el seam-leveling
-    #   debería funcionar: iguala el BRILLO entre fotos (arregla zonas oscuras)
-    #   y suaviza las costuras de color, MANTENIENDO la suavidad de Poisson.
-    #   Si aun así crashea aquí (std::out_of_range), el pod se corta y me pasas
-    #   el log → volvemos al original (Poisson + seam OFF) y de ahí a la Opción 1.
+    # ⚠️ SEAM LEVELING APAGADO (CONFIRMADO 2 veces que crashea con Poisson).
+    #   Probamos encenderlo con la malla limpia (Opción 2) y AÚN crashea
+    #   (std::out_of_range): el seam-leveling necesita datos de visibilidad
+    #   por-vértice que la malla de Poisson NO tiene, por más limpia que esté.
+    #   Conclusión: seam-leveling + Poisson son incompatibles. Va en 0 (original
+    #   que SÍ funcionó). El brillo lo arreglamos en post-proceso (Opción 1).
     empty_gris = str(0xBEBEBE)  # gris claro en decimal = 12500670
     log("OpenMVS 5/5: TextureMesh (color + relleno gris, NO negro)...")
     # CONTRA EL EFECTO "DESLAVADO"/BORROSO:
@@ -773,8 +742,8 @@ def run_openmvs():
          "-m", refined.name,
          "--export-type", "obj",
          "--max-texture-size", "4096",
-         "--global-seam-leveling", "1",
-         "--local-seam-leveling", "1",
+         "--global-seam-leveling", "0",
+         "--local-seam-leveling", "0",
          "--cost-smoothness-ratio", "0.1",
          "--empty-color", empty_gris,
          "-o", "scene_textured.obj"],
@@ -1015,12 +984,26 @@ def limpiar_puntos_colores(img_bgr):
 
 
 def realce_suave(img_bgr):
-    """Realce de contraste local SUAVE (CLAHE) para que las zonas 'deslavadas'
-    recuperen algo de definición, sin exagerar ni saturar colores."""
+    """OPCIÓN 1 — aclara las zonas OSCURAS (sombras) sin quemar las claras.
+    Es nuestro arreglo de las manchas oscuras SIN tocar el texturizado (así no
+    puede causar el crash del seam-leveling). Dos pasos:
+      1) Curva 'gamma' (<1) que LEVANTA las sombras: sube mucho el brillo de los
+         píxeles oscuros y casi nada el de los claros → no se quema lo brillante.
+      2) Contraste local suave (CLAHE) para recuperar definición.
+    Trabaja solo sobre la luz (canal L de LAB), así NO satura ni cambia colores.
+    """
     try:
+        import cv2
+        import numpy as np
         lab = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2LAB)
         l, a, b = cv2.split(lab)
-        clahe = cv2.createCLAHE(clipLimit=1.5, tileGridSize=(8, 8))
+        # 1) levantar sombras (gamma 0.80: aclara oscuros, respeta claros)
+        gamma = 0.80
+        lut = np.array([((i / 255.0) ** gamma) * 255 for i in range(256)],
+                       dtype=np.uint8)
+        l = cv2.LUT(l, lut)
+        # 2) contraste local suave (un poco más que antes: 1.5 → 2.0)
+        clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
         l = clahe.apply(l)
         return cv2.cvtColor(cv2.merge([l, a, b]), cv2.COLOR_LAB2BGR)
     except Exception:
