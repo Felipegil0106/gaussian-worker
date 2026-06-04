@@ -308,6 +308,60 @@ def filter_blur():
     log(f"Nítidas: {kept}, Borrosas eliminadas: {len(to_remove)}")
     return kept
 
+
+# Igualar exposición: ON. Reemplaza al seam-leveling (que crashea con Poisson).
+USAR_IGUALAR_EXPOSICION = True
+
+def igualar_exposicion():
+    """IGUALA LA EXPOSICIÓN (brillo/contraste) de TODAS las fotos a un objetivo
+    común, ANTES de COLMAP/OpenMVS. Es el REEMPLAZO del seam-leveling (que
+    crashea con la malla de Poisson): las fotos se tomaron con auto-exposición,
+    cada una con brillo distinto; al pegar fotos vecinas en parches contiguos se
+    ven 'mapitas' de tono. Si TODAS tienen el mismo brillo, los parches ya no
+    saltan → piso/clóset/paredes se ven PAREJOS. Solo toca la LUZ (canal L de
+    LAB): NO cambia los colores (matiz). NO puede crashear (es solo imagen)."""
+    import cv2
+    import numpy as np
+    frames = sorted([f for f in os.listdir(FRAMES_DIR) if f.endswith(".jpg")])
+    if len(frames) < 2:
+        return 0
+    # Pasada 1: medir brillo (media) y contraste (std) del canal L de cada foto.
+    medias, stds = [], []
+    for f in frames:
+        img = cv2.imread(str(FRAMES_DIR / f))
+        if img is None:
+            medias.append(None); stds.append(None); continue
+        L = cv2.cvtColor(img, cv2.COLOR_BGR2LAB)[:, :, 0].astype(np.float32)
+        medias.append(float(L.mean())); stds.append(float(L.std()) + 1e-6)
+    vals_m = [m for m in medias if m is not None]
+    vals_s = [s for s in stds if s is not None]
+    if not vals_m:
+        return 0
+    objetivo_media = float(np.mean(vals_m))
+    objetivo_std = float(np.mean(vals_s))
+    log(f"   exposición objetivo: brillo medio {objetivo_media:.1f}, "
+        f"contraste {objetivo_std:.1f}")
+    # Pasada 2: ajustar cada foto a ese objetivo (solo el canal L).
+    ajustadas = 0
+    for i, f in enumerate(frames):
+        if medias[i] is None:
+            continue
+        img = cv2.imread(str(FRAMES_DIR / f))
+        if img is None:
+            continue
+        lab = cv2.cvtColor(img, cv2.COLOR_BGR2LAB).astype(np.float32)
+        L = lab[:, :, 0]
+        # Escala de contraste CLAMPED (0.8–1.2) para NO exagerar fotos planas.
+        escala = objetivo_std / stds[i]
+        escala = max(0.8, min(1.2, escala))
+        L = (L - medias[i]) * escala + objetivo_media
+        lab[:, :, 0] = np.clip(L, 0, 255)
+        out = cv2.cvtColor(lab.astype(np.uint8), cv2.COLOR_LAB2BGR)
+        cv2.imwrite(str(FRAMES_DIR / f), out, [cv2.IMWRITE_JPEG_QUALITY, 95])
+        ajustadas += 1
+    log(f"   exposición igualada en {ajustadas} fotos (parches sin salto de tono)")
+    return ajustadas
+
 # ══════════════════════════════════════════════════════════════
 # ETAPA 3: DEPTH ANYTHING V2
 # ══════════════════════════════════════════════════════════════
@@ -1536,6 +1590,17 @@ def main():
         # (El código de gen_depth/gen_masks sigue en el archivo por si algún
         #  día se reactivan, pero aquí no se llaman.)
         log("Etapas Depth/Masks omitidas (no se requieren para malla)")
+
+        # IGUALAR EXPOSICIÓN de las fotos (reemplazo del seam-leveling, sin
+        # crash): empareja el brillo de todas para que los parches de textura
+        # no salten de tono (piso/clóset parejos). Va ANTES de COLMAP para que
+        # las fotos igualadas se usen en todo el proceso (incl. el texturizado).
+        if USAR_IGUALAR_EXPOSICION:
+            report(0.43, "Igualando exposición de las fotos")
+            try:
+                igualar_exposicion()
+            except Exception as _e:
+                log(f"   (igualar exposición falló: {_e}; sigo sin igualar)", "WARN")
 
         # ETAPA 5: COLMAP (ubica las cámaras — base para OpenMVS)
         report(0.45, "COLMAP (posiciones de cámara)")
