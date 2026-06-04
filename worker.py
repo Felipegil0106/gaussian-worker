@@ -1600,20 +1600,37 @@ def main():
             z.extractall(RAW_DIR)
         INPUT_ZIP.unlink(missing_ok=True)
 
-        # Aplanar subcarpetas si las hay
+        # Aplanar subcarpetas si las hay.
+        # ROBUSTO ante DUPLICADOS: si el ZIP trae el mismo archivo en una
+        # subcarpeta y también suelto (o 'images/' + raíz), shutil.move falla
+        # con "Destination already exists". Para evitarlo, si el destino ya
+        # existe lo borramos antes de mover (nos quedamos con una copia).
+        def _mover_sobrescribiendo(origen, carpeta_destino):
+            destino = os.path.join(str(carpeta_destino), os.path.basename(origen))
+            if os.path.abspath(origen) == os.path.abspath(destino):
+                return
+            if os.path.exists(destino):
+                try:
+                    os.remove(destino)
+                except Exception:
+                    pass
+            shutil.move(origen, destino)
         for _ in range(3):
             items = os.listdir(RAW_DIR)
             if len(items) == 1 and os.path.isdir(RAW_DIR / items[0]):
                 inner = RAW_DIR / items[0]
                 for f in os.listdir(inner):
-                    shutil.move(str(inner / f), str(RAW_DIR))
+                    _mover_sobrescribiendo(str(inner / f), RAW_DIR)
                 inner.rmdir()
             else:
                 break
         if (RAW_DIR / "images").is_dir():
             for f in os.listdir(RAW_DIR / "images"):
-                shutil.move(str(RAW_DIR / "images" / f), str(RAW_DIR))
-            (RAW_DIR / "images").rmdir()
+                _mover_sobrescribiendo(str(RAW_DIR / "images" / f), RAW_DIR)
+            try:
+                (RAW_DIR / "images").rmdir()
+            except OSError:
+                pass
 
         # ETAPA 1
         report(0.15, "Extracción de frames")
