@@ -506,12 +506,11 @@ def run_openmvs():
     # ── CONTRA MANCHAS NEGRAS (huecos de MALLA, no falta de foto) ──
     # Tus manchas negras eran zonas que SÍ se fotografiaron, pero la malla no
     # tenía superficie ahí (por eso 300k las tapaba: más malla = se pinta la
-    # foto real). En vez de subir puntos (que ensucia con parches), cerramos
-    # los huecos de la malla AQUÍ: subimos close-holes de 100 a 300 → cierra
-    # huecos más grandes con superficie continua → TextureMesh pinta la foto
-    # real en esa zona, sin invento. Sin el costo de 300k.
+    # foto real). close-holes 300 tapó muchas; subimos a 500 para cerrar los
+    # huecos que AÚN quedan (pared/ventana/clóset). Sigue sin subir puntos, así
+    # evitamos el costo de 300k (parches/saturación).
     run(["ReconstructMesh", dense.name,
-         "--close-holes", "300",
+         "--close-holes", "500",
          "--remove-spurious", "30",
          "--decimate", "0.5",
          "--smooth", "3"],
@@ -642,12 +641,12 @@ def run_openmvs():
             callback({"type":"progress", "progress":_current_progress,
                       "message":"Poisson: limpiando y suavizando...", "log": full_log()})
             # Recortar las zonas "infladas" de baja densidad (artefactos Poisson)
-            # CONTRA MANCHAS NEGRAS: bajamos el recorte de 5% a 2%. El 5% quitaba
-            # superficie en los BORDES (donde la densidad baja), abriendo huecos
-            # que salían negros. Con 2% conservamos más superficie en los bordes
-            # → menos huecos → TextureMesh pinta más zona con foto real.
+            # CONTRA MANCHAS NEGRAS: bajamos el recorte a 1% (antes 5%, luego 2%).
+            # El recorte alto quitaba superficie en los BORDES (donde la densidad
+            # baja), abriendo huecos negros. Con 1% conservamos casi toda la
+            # superficie → menos huecos → TextureMesh pinta más zona con foto real.
             _dens = _npp.asarray(_dens)
-            _pm.remove_vertices_by_mask(_dens < _npp.quantile(_dens, 0.02))
+            _pm.remove_vertices_by_mask(_dens < _npp.quantile(_dens, 0.01))
             log(f"   [Poisson] tras recortar baja densidad: {len(_pm.vertices):,} vértices")
             # Si quedó muy densa, simplificar a ~600K caras (como Polycam).
             if len(_pm.triangles) > 600000:
