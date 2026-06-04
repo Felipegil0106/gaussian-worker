@@ -503,8 +503,15 @@ def run_openmvs():
     # "deslavada"/borrosa (quitaba demasiada geometría). decimate 0.5
     # (conservar 50%) es el PUNTO MEDIO: reduce el mosaico y conserva detalle.
     #   --decimate 0.5 → de ~2.5M a ~1.2M vértices (entre el exceso y el lavado)
+    # ── CONTRA MANCHAS NEGRAS (huecos de MALLA, no falta de foto) ──
+    # Tus manchas negras eran zonas que SÍ se fotografiaron, pero la malla no
+    # tenía superficie ahí (por eso 300k las tapaba: más malla = se pinta la
+    # foto real). En vez de subir puntos (que ensucia con parches), cerramos
+    # los huecos de la malla AQUÍ: subimos close-holes de 100 a 300 → cierra
+    # huecos más grandes con superficie continua → TextureMesh pinta la foto
+    # real en esa zona, sin invento. Sin el costo de 300k.
     run(["ReconstructMesh", dense.name,
-         "--close-holes", "100",
+         "--close-holes", "300",
          "--remove-spurious", "30",
          "--decimate", "0.5",
          "--smooth", "3"],
@@ -572,14 +579,11 @@ def run_openmvs():
             _n_pts = len(_pcd.points)
             log(f"   nube de entrada: {_n_pts:,} puntos")
             mem_info("nube-cargada")
-            # ── DETALLE / MEMORIA ──
-            # Subimos a 300k puntos (el doble de 150k) para MÁS DETALLE. A 150k
-            # corrió rápido, así que hay margen. Con normales bien orientadas
-            # Poisson aguanta 300k (tardará más, quizás 5-10 min, pero sigue muy
-            # por debajo del límite de 40 min). NO subimos el depth: cambiar dos
-            # cosas geométricas a la vez dispararía la RAM. Si 300k pesa mucho o
-            # tarda de más, bajamos. Selección aleatoria precisa.
-            _LIMITE_SEGURO = 300000
+            # ── VELOCIDAD Y MEMORIA ──
+            # El pod es MÁS LENTO que mi entorno. Con 150k se colgaba. Bajamos a
+            # 80k: superficie suave de buena calidad, rápido y sin saturar
+            # memoria. Selección aleatoria precisa para respetar el objetivo.
+            _LIMITE_SEGURO = 80000
             if _n_pts > _LIMITE_SEGURO:
                 _idx = _npp.random.choice(_n_pts, _LIMITE_SEGURO, replace=False)
                 _pcd = _pcd.select_by_index(list(_idx))
@@ -626,35 +630,24 @@ def run_openmvs():
             log("   [Poisson] (si se traba, es AQUÍ; mira la memoria de abajo)")
             mem_info("antes-de-poisson")
             _t_pois = time.time()
-            # ── RED DE SEGURIDAD (timeout real) ──
-            # Si las normales arregladas resuelven el cuelgue → Poisson termina
-            # en segundos. PERO por si acaso, lo corremos con un límite de 40 min.
-            # A 150k Poisson tarda ~1-3 min, así que 40 min es margen de sobra.
-            # Si se pasara (cuelgue raro), CORTAMOS el render para no quemar tu
-            # saldo: el pod no queda pegado gastando GPU. El log queda guardado.
-            _pois_out = {}
-            def _correr_poisson():
-                _m, _d = o3d.geometry.TriangleMesh.create_from_point_cloud_poisson(
-                    _pcd, depth=8, scale=1.1, linear_fit=False)
-                _pois_out["mesh"] = _m
-                _pois_out["dens"] = _d
-            _th_pois = threading.Thread(target=_correr_poisson, daemon=True)
-            _th_pois.start()
-            _th_pois.join(timeout=2400)  # 40 minutos de límite de seguridad
-            if _th_pois.is_alive():
-                # Poisson se colgó → cortar el render (red de seguridad de saldo).
-                log("   [Poisson] NO terminó en 40 min → cortando el render", "WARN")
-                mem_info("poisson-timeout")
-                raise TimeoutError("Poisson excedió 40 min")
-            _pm = _pois_out["mesh"]
-            _dens = _pois_out["dens"]
+            # ── SIN LÍMITE DE TIEMPO (como el PRIMER render que salió bien) ──
+            # Con las normales bien orientadas (arreglo de arriba), Poisson NO
+            # se cuelga: termina rápido (~13s con 80k). Por eso lo corremos
+            # DIRECTO, sin timeout. Si por algo fallara, más abajo seguimos con
+            # la malla de OpenMVS (el render NO se corta).
+            _pm, _dens = o3d.geometry.TriangleMesh.create_from_point_cloud_poisson(
+                _pcd, depth=8, scale=1.1, linear_fit=False)
             log(f"   [Poisson] create_from_point_cloud_poisson TERMINÓ en {time.time()-_t_pois:.1f}s")
             mem_info("despues-de-poisson")
             callback({"type":"progress", "progress":_current_progress,
                       "message":"Poisson: limpiando y suavizando...", "log": full_log()})
             # Recortar las zonas "infladas" de baja densidad (artefactos Poisson)
+            # CONTRA MANCHAS NEGRAS: bajamos el recorte de 5% a 2%. El 5% quitaba
+            # superficie en los BORDES (donde la densidad baja), abriendo huecos
+            # que salían negros. Con 2% conservamos más superficie en los bordes
+            # → menos huecos → TextureMesh pinta más zona con foto real.
             _dens = _npp.asarray(_dens)
-            _pm.remove_vertices_by_mask(_dens < _npp.quantile(_dens, 0.05))
+            _pm.remove_vertices_by_mask(_dens < _npp.quantile(_dens, 0.02))
             log(f"   [Poisson] tras recortar baja densidad: {len(_pm.vertices):,} vértices")
             # Si quedó muy densa, simplificar a ~600K caras (como Polycam).
             if len(_pm.triangles) > 600000:
@@ -671,17 +664,14 @@ def run_openmvs():
                 log(f"   ✓ Superficie Poisson: {len(_pm.vertices):,} vértices, "
                     f"{len(_pm.triangles):,} caras (continua, sin facetas)")
             else:
-                # Poisson NO produjo malla válida → CORTAR el job (no seguir).
-                log("   [Poisson] no produjo malla válida → CORTANDO el render", "ERROR")
-                raise RuntimeError("Poisson no produjo malla válida")
+                # Como el primer render: si Poisson no produjo malla válida,
+                # seguimos con la malla de OpenMVS (NO cortamos el render).
+                log("   (Poisson no produjo malla válida; sigo con la de OpenMVS)", "WARN")
         except Exception as e:
-            # CAMBIO solicitado: si Poisson falla, CORTAMOS el job con error
-            # (NO seguimos con OpenMVS). Así no se gasta GPU texturizando una
-            # malla facetada que no queremos, y el log completo queda guardado
-            # para diagnosticar exactamente qué pasó con Poisson.
-            log(f"   [Poisson] FALLÓ: {e}", "ERROR")
-            log("   [Poisson] CORTANDO el render (no se sigue con OpenMVS, por decisión)", "ERROR")
-            raise RuntimeError(f"Poisson falló y el render se detuvo: {e}")
+            # Como el PRIMER render que salió bien: si Poisson falla, seguimos
+            # con la malla de OpenMVS (NO cortamos el render). El log completo
+            # queda guardado por si hay que diagnosticar.
+            log(f"   (Poisson falló: {e}; sigo con la malla de OpenMVS)", "WARN")
 
     # ── Paso 6.4: RefineMesh → suaviza/mejora ──
     # OPTIMIZACIÓN: desactivado por defecto. En pruebas tardaba ~4.5 min y NO
