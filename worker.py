@@ -56,7 +56,10 @@ TIMEOUTS = {
 }
 ITERS = {"fast":7000, "balanced":30000, "quality":50000}
 
-BLUR_THRESHOLD_ABSOLUTE = 30.0
+# UMBRAL DE BORROSAS bajado un POCO (30 → 22) a pedido del usuario: conserva
+# más fotos válidas (recupera ángulos/zonas como la ventana) sin meter basura
+# muy borrosa. Es un ajuste suave, no agresivo.
+BLUR_THRESHOLD_ABSOLUTE = 22.0
 BLUR_PERCENTILE_FALLBACK = 25
 MIN_VALID_RATIO = 0.5
 MIN_IMGS, MAX_IMGS = 20, 1000
@@ -309,8 +312,12 @@ def filter_blur():
     return kept
 
 
-# Igualar exposición: ON. Reemplaza al seam-leveling (que crashea con Poisson).
-USAR_IGUALAR_EXPOSICION = True
+# Igualar exposición: OFF. Confirmamos que reescribir el brillo de TODAS las
+# fotos desajustaba zonas que ya estaban bien (empeoraba). Además, texrecon
+# (MVS-Texturing) ahora hace el ajuste de tono CORRECTO entre parches (global
+# color adjustment), que es lo que de verdad mata los mapitas. Por eso la
+# apagamos. (La dejamos en el código por si algún día se quiere reactivar.)
+USAR_IGUALAR_EXPOSICION = False
 
 def igualar_exposicion():
     """IGUALA LA EXPOSICIÓN (brillo/contraste) de TODAS las fotos a un objetivo
@@ -753,38 +760,81 @@ def run_openmvs():
     else:
         log("OpenMVS 4/5: RefineMesh OMITIDO (optimización; la malla cruda basta)")
 
-    # ── Paso 6.5: TextureMesh → pega las fotos sobre la malla → .obj final ──
-    # RECONSTRUCCIÓN (la clave del COLOR, estudiando Polycam):
-    #   Polycam NUNCA deja negro: si una cara no se ve bien, usa color vecino.
-    #   OpenMVS por defecto deja las zonas sin foto en NEGRO (de ahí el problema).
-    # SOLUCIÓN: --empty-color con un GRIS claro (no negro). El valor es un entero
-    #   0xRRGGBB; usamos 0xBEBEBE (gris claro ~190) para que las zonas sin foto
-    #   se vean GRISES neutras, no negras. Así el render NUNCA se ve negro.
-    #   --max-texture-size 4096 → archivo liviano que carga bien.
+    # ══════════════════════════════════════════════════════════════
+    # Paso 6.5: TEXTURIZADO — texrecon (MVS-Texturing) sobre la malla Poisson
+    # ══════════════════════════════════════════════════════════════
+    # CAMBIO DE FONDO (v3): texturizamos con MVS-Texturing (binario 'texrecon')
+    # en vez del TextureMesh de OpenMVS. ¿Por qué? El seam-leveling de OpenMVS
+    # (lo que iguala el tono entre parches y mata los "mapitas") CRASHEA sobre
+    # la malla de Poisson. texrecon hace lo mismo y MEJOR (global color
+    # adjustment + Poisson blending en las costuras) y SÍ acepta la malla de
+    # Poisson, usando las cámaras de COLMAP. Objetivo: Poisson (sin triángulos)
+    # + sin mapas (tono parejo).
     #
-    # ⚠️ SEAM LEVELING DESACTIVADO (causa del crash std::out_of_range):
-    #   El seam-leveling (igualar color entre parches) de OpenMVS CRASHEA con
-    #   mallas que NO salieron de su propio ReconstructMesh. Nuestra malla viene
-    #   de Poisson (open3d), que no trae los datos de visibilidad por-vértice que
-    #   el seam-leveling necesita → intenta leer una llave que no existe en su
-    #   mapa interno → std::out_of_range → rc=-6 → crash en el último paso.
-    #   Poniendo global/local seam-leveling en 0, OpenMVS se salta ese paso y
-    #   genera la textura igual (puede que con costuras de color algo visibles,
-    #   pero el render TERMINA y sale el .glb). La calidad de costuras se puede
-    #   recuperar después; ahora la prioridad es obtener el archivo final.
-    # ⚠️ SEAM LEVELING APAGADO (CONFIRMADO 2 veces que crashea con Poisson).
-    #   Probamos encenderlo con la malla limpia (Opción 2) y AÚN crashea
-    #   (std::out_of_range): el seam-leveling necesita datos de visibilidad
-    #   por-vértice que la malla de Poisson NO tiene, por más limpia que esté.
-    #   Conclusión: seam-leveling + Poisson son incompatibles. Va en 0 (original
-    #   que SÍ funcionó). El brillo lo arreglamos en post-proceso (Opción 1).
+    # REGLA PEDIDA POR EL USUARIO: si texrecon (lo NUEVO) falla, el render PARA
+    # de inmediato y manda el log. NO seguimos con OpenMVS ni con nada, para
+    # poder arreglar el error antes de continuar. (Cambiar USAR_TEXRECON=False
+    # solo si queremos volver a propósito al texturizado de OpenMVS.)
+    USAR_TEXRECON = True
+    if USAR_TEXRECON:
+        log("Texturizado 1/1: MVS-Texturing (texrecon) sobre malla Poisson...")
+        # texrecon necesita las cámaras en formato .nvm (VisualSFM). COLMAP las
+        # exporta directo desde el modelo sparse. Usamos el modelo .bin de
+        # COLMAP_DIR/sparse (el undistort lo dejó ahí en formato COLMAP).
+        _nvm_dir = mvs_dir / "nvm"
+        _nvm_dir.mkdir(exist_ok=True)
+        _nvm = _nvm_dir / "scene.nvm"
+        # El modelo undistortado quedó en COLMAP_DIR/sparse (formato COLMAP).
+        _sparse_model = COLMAP_DIR / "sparse"
+        if not (_sparse_model / "cameras.bin").exists():
+            # fallback: usar el sparse/0 original
+            _sparse_model = COLMAP_DIR / "sparse" / "0"
+        run(["colmap", "model_converter",
+             "--input_path", str(_sparse_model),
+             "--output_path", str(_nvm),
+             "--output_type", "NVM"],
+            TIMEOUTS["colmap_undistort"], "nvm_export")
+        if not _nvm.exists():
+            raise RuntimeError("No se pudo exportar el .nvm de COLMAP para texrecon")
+        log(f"   cámaras exportadas a .nvm: {_nvm.name}")
+        # texrecon: <in_scene .nvm> <in_mesh .ply> <out_prefix>
+        #   --outlier_removal=gauss_clamping  → quita píxeles atípicos (brillos)
+        #   --tone_mapping=none               → no alterar color base
+        #   El global color adjustment + seam leveling de texrecon vienen
+        #   ACTIVADOS por defecto (justo lo que mata los mapitas).
+        _tex_prefix = mvs_dir / "textured_texrecon"
+        run(["texrecon",
+             str(_nvm),
+             str(mesh),                       # la malla de Poisson
+             str(_tex_prefix),
+             "--outlier_removal=gauss_clamping",
+             "--tone_mapping=none",
+             "--no_intermediate_results"],
+            TIMEOUTS["mvs_texture"], "texrecon", cwd=str(mvs_dir))
+        # texrecon genera <prefijo>.obj + <prefijo>.mtl + <prefijo>.png/material
+        try:
+            generados = sorted(os.listdir(str(mvs_dir)))
+            log(f"   texrecon generó: {generados}")
+        except Exception:
+            pass
+        textured = _find_first(mvs_dir, [
+            "textured_texrecon.obj", "textured_texrecon_texture.obj"])
+        if textured is None:
+            # Buscar cualquier .obj que empiece por el prefijo
+            for _f in sorted(os.listdir(str(mvs_dir))):
+                if _f.startswith("textured_texrecon") and _f.endswith(".obj"):
+                    textured = mvs_dir / _f
+                    break
+        if textured is None:
+            raise RuntimeError("texrecon no generó el .obj texturizado")
+        log(f"OpenMVS+texrecon OK → malla texturizada: {textured.name}")
+        return str(textured)
+
+    # ── (LEGADO) Texturizado con OpenMVS TextureMesh — solo si USAR_TEXRECON=False ──
+    # Se conserva por si queremos volver a propósito. El seam-leveling va en 0
+    # (crashea con Poisson). Deja mapitas de tono; por eso pasamos a texrecon.
     empty_gris = str(0xBEBEBE)  # gris claro en decimal = 12500670
-    log("OpenMVS 5/5: TextureMesh (color + relleno gris, NO negro)...")
-    # CONTRA EL EFECTO "DESLAVADO"/BORROSO:
-    # Bajamos el suavizado de textura para conservar más nitidez por zona.
-    # NOTA: textura en 4096 (NO 8192). Con 8192, LaMa intentaba cargar la
-    # imagen completa en la GPU y pedía ~49 GB → CUDA out of memory → crash.
-    # 4096 es buena resolución y LaMa la aguanta sin quedarse sin memoria.
+    log("OpenMVS 5/5: TextureMesh (LEGADO; relleno gris, NO negro)...")
     run(["TextureMesh", dense.name,
          "-m", refined.name,
          "--export-type", "obj",
