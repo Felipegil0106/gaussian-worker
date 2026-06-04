@@ -781,9 +781,12 @@ def run_openmvs():
         # texrecon necesita las cámaras en formato .nvm (VisualSFM). COLMAP las
         # exporta directo desde el modelo sparse. Usamos el modelo .bin de
         # COLMAP_DIR/sparse (el undistort lo dejó ahí en formato COLMAP).
-        _nvm_dir = mvs_dir / "nvm"
-        _nvm_dir.mkdir(exist_ok=True)
-        _nvm = _nvm_dir / "scene.nvm"
+        # CLAVE (arreglo del error 'frame_XXXXX.jpg: No such file'): texrecon
+        # busca las imágenes AL LADO del .nvm (el .nvm guarda los nombres de
+        # foto como rutas relativas). Por eso el .nvm DEBE ir en la MISMA
+        # carpeta que las imágenes undistortadas: COLMAP_DIR/images/.
+        _img_dir = COLMAP_DIR / "images"
+        _nvm = _img_dir / "scene.nvm"
         # El modelo undistortado quedó en COLMAP_DIR/sparse (formato COLMAP).
         _sparse_model = COLMAP_DIR / "sparse"
         if not (_sparse_model / "cameras.bin").exists():
@@ -796,7 +799,7 @@ def run_openmvs():
             TIMEOUTS["colmap_undistort"], "nvm_export")
         if not _nvm.exists():
             raise RuntimeError("No se pudo exportar el .nvm de COLMAP para texrecon")
-        log(f"   cámaras exportadas a .nvm: {_nvm.name}")
+        log(f"   cámaras exportadas a .nvm: {_nvm} (junto a las imágenes)")
         # texrecon: <in_scene .nvm> <in_mesh .ply> <out_prefix>
         #   --outlier_removal=gauss_clamping  → quita píxeles atípicos (brillos)
         #   --tone_mapping=none               → no alterar color base
